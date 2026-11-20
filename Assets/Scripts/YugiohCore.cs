@@ -269,10 +269,117 @@ public class Duel
         }
     }
 
-    public bool ActivateSpell(Player p, CardData spell, MonsterCard protectedMonster = null)
+    public static bool CanActivateSpellOrTrap(
+        CardData spell,
+        Player caster,
+        Player enemy,
+        int casterDeckCount,
+        bool casterDeckHasSpellOrTrap,
+        bool casterGraveyardHasMonster,
+        out string failReason)
+    {
+        failReason = "";
+        if (spell == null || !spell.IsSpellOrTrap)
+        {
+            failReason = "Không phải bài Phép/Bẫy.";
+            return false;
+        }
+        if (caster == null || enemy == null)
+        {
+            failReason = "Dữ liệu người chơi chưa sẵn sàng.";
+            return false;
+        }
+
+        switch (spell.spellEffect)
+        {
+            case SpellEffectType.DestroyAllEnemyMonsters:
+                if (enemy.MonsterCount == 0)
+                {
+                    failReason = "Đối phương chưa có quái thú trên sân.";
+                    return false;
+                }
+                return true;
+
+            case SpellEffectType.DestroyAllMonsters:
+                if (caster.MonsterCount + enemy.MonsterCount == 0)
+                {
+                    failReason = "Trên sân chưa có quái thú nào.";
+                    return false;
+                }
+                return true;
+
+            case SpellEffectType.DrawCards:
+                if (casterDeckCount <= 0)
+                {
+                    failReason = "Bộ bài đã hết lá để rút.";
+                    return false;
+                }
+                return true;
+
+            case SpellEffectType.BuffAllMyMonstersATK:
+                if (caster.MonsterCount == 0)
+                {
+                    failReason = "Bạn chưa có quái thú trên sân để tăng ATK.";
+                    return false;
+                }
+                return true;
+
+            case SpellEffectType.DebuffAllEnemyMonstersATK:
+                if (enemy.MonsterCount == 0)
+                {
+                    failReason = "Đối phương chưa có quái thú trên sân.";
+                    return false;
+                }
+                return true;
+
+            case SpellEffectType.ReviveFromGraveyard:
+                if (caster.FirstEmptyZone() < 0)
+                {
+                    failReason = "Sân quái thú của bạn đã đầy chỗ.";
+                    return false;
+                }
+                if (!casterGraveyardHasMonster)
+                {
+                    failReason = "Trong Mộ bài chưa có quái thú để hồi sinh.";
+                    return false;
+                }
+                return true;
+
+            case SpellEffectType.SwordsOfRevealingLight:
+                if (enemy.swordsBlockTurnsRemaining > 0)
+                {
+                    failReason = $"Đang còn hiệu lực khóa {enemy.swordsBlockTurnsRemaining} lượt trên sân.";
+                    return false;
+                }
+                return true;
+
+            case SpellEffectType.MagicalHats:
+                if (caster.MonsterCount == 0)
+                {
+                    failReason = "Cần ít nhất 1 quái thú của bạn trên sân.";
+                    return false;
+                }
+                if (caster.MonsterCount >= Player.ZoneCount)
+                {
+                    failReason = "Không còn ô quái thú trống trên sân.";
+                    return false;
+                }
+                if (!casterDeckHasSpellOrTrap)
+                {
+                    failReason = "Trong Deck không còn lá Phép/Bẫy nào.";
+                    return false;
+                }
+                return true;
+
+            default:
+                return true;
+        }
+    }
+
+    public bool ActivateSpell(Player p, CardData spell, MonsterCard protectedMonster = null, bool allowOutOfTurnReaction = false)
     {
         if (IsGameOver || spell == null || !spell.IsSpellOrTrap) return false;
-        if (spell.cardType == CardType.Spell && p != Current)
+        if (spell.cardType == CardType.Spell && p != Current && !allowOutOfTurnReaction)
         {
             Log("Không phải lượt của bạn.");
             return false;
@@ -346,6 +453,12 @@ public class Duel
 
             case SpellEffectType.SwordsOfRevealingLight:
                 {
+                    if (enemy.swordsBlockTurnsRemaining > 0)
+                    {
+                        Log($"[{spell.cardName}] đang còn hiệu lực khóa {enemy.name} (còn {enemy.swordsBlockTurnsRemaining} lượt), không thể kích hoạt chồng thêm!");
+                        return false;
+                    }
+
                     OnSpellActivated?.Invoke(spell);
 
                     var faceDownEnemies = enemy.Monsters.Where(m => m.IsFaceDown).ToList();
@@ -655,6 +768,13 @@ public class Duel
 
         if (card.isMagicalHatDecoy)
         {
+            if (destroyedByBattle)
+            {
+                string hatName = card.originalSpellTrapData != null
+                    ? $"Mũ Tơ ({card.originalSpellTrapData.cardName})"
+                    : "Mũ Tơ Ma Thuật";
+                Log($"{hatName} bị phá hủy!");
+            }
             if (card.originalSpellTrapData != null)
             {
                 OnSendCardToGraveyard?.Invoke(card.owner, card.originalSpellTrapData);

@@ -569,6 +569,7 @@ public class DeckManager : MonoBehaviour
         }
 
         SaveDeckToPrefs();
+        MatchSessionConfig.ResetToSingleplayer();
         Time.timeScale = 1f;
         SceneManager.LoadScene(battleSceneName);
     }

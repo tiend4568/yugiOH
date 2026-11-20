@@ -553,6 +553,14 @@ MonoBehaviour:
   sfxList:
   - id: Click
     clip: {fileID: 8300000, guid: 8e6f9bbeed8f8904f8626d5c7f219f62, type: 3}
+  - id: Destroy
+    clip: {fileID: 8300000, guid: 8724cb84b11064b4580930f7f51d7d15, type: 3}
+  - id: Damage
+    clip: {fileID: 8300000, guid: a2b1b8c79ae0475408fe8599ada881c3, type: 3}
+  - id: Draw
+    clip: {fileID: 8300000, guid: 6386300b0af64ab45971db7aee5acc4f, type: 3}
+  - id: Summon
+    clip: {fileID: 8300000, guid: dc2231c7a15744f4b9da71664f392f88, type: 3}
   musicVolume: 0.6
   sfxVolume: 1
 --- !u!4 &116849815
@@ -1662,7 +1670,7 @@ RectTransform:
   m_AnchorMin: {x: 0, y: 0}
   m_AnchorMax: {x: 0, y: 0}
   m_AnchoredPosition: {x: 0, y: 0}
-  m_SizeDelta: {x: 160, y: 50}
+  m_SizeDelta: {x: 263.071, y: 50}
   m_Pivot: {x: 0.5, y: 0.5}
 --- !u!114 &501596959
 MonoBehaviour:
@@ -2836,7 +2844,7 @@ MonoBehaviour:
   m_OnCullStateChanged:
     m_PersistentCalls:
       m_Calls: []
-  m_text: "CH\u01A0I\n"
+  m_text: "\u0110\u1EA4U V\u1EDAI AI"
   m_isRightToLeft: 0
   m_fontAsset: {fileID: 11400000, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}
   m_sharedMaterial: {fileID: 2180264, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}
@@ -3207,6 +3215,7 @@ MonoBehaviour:
   mainMenuPanel: {fileID: 1485639621}
   deckPanel: {fileID: 1298742083}
   settingsPanel: {fileID: 1514956403}
+  multiplayerLobbyPanel: {fileID: 0}
 --- !u!4 &1453135715
 Transform:
   m_ObjectHideFlags: 0
@@ -3443,7 +3452,7 @@ RectTransform:
   m_AnchorMin: {x: 0, y: 0}
   m_AnchorMax: {x: 0, y: 0}
   m_AnchoredPosition: {x: 0, y: 0}
-  m_SizeDelta: {x: 160, y: 50}
+  m_SizeDelta: {x: 264.283, y: 50}
   m_Pivot: {x: 0.5, y: 0.5}
 --- !u!114 &1827696254
 MonoBehaviour:
@@ -3580,12 +3589,24 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 2211781fc435ba542afa8b71846b5b8c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  cardPrefab: {fileID: 6033011328224986771, guid: 2ea3e8be69d3a5744b7940189485a537, type: 3}
+  minDeckSize: 20
+  maxDeckSize: 40
+  maxCopiesPerCard: 3
+  cardDatabase: {fileID: 0}
+  monsterResourceFolder: Cards/Monster
+  spellResourceFolder: Cards/Spell
+  trapResourceFolder: Cards/Trap
+  battleSceneName: BattleScene
   collectionContent: {fileID: 2057680384}
-  equippedContent: {fileID: 1417868143}
-  maxTotalDeckSize: 40
-  folderPath: Cards/Monster
-  warningText: {fileID: 170894931}
+  deckContent: {fileID: 0}
+  cardItemPrefab: {fileID: 0}
+  deckCountText: {fileID: 0}
+  statusText: {fileID: 0}
+  playButton: {fileID: 0}
+  previewImage: {fileID: 0}
+  previewNameText: {fileID: 0}
+  previewStatsText: {fileID: 0}
+  previewDescText: {fileID: 0}
 --- !u!4 &1838020309
 Transform:
   m_ObjectHideFlags: 0
@@ -3819,7 +3840,7 @@ RectTransform:
   m_AnchorMin: {x: 0, y: 0}
   m_AnchorMax: {x: 0, y: 0}
   m_AnchoredPosition: {x: 0, y: 0}
-  m_SizeDelta: {x: 200, y: 70}
+  m_SizeDelta: {x: 269.118, y: 120.929}
   m_Pivot: {x: 0.5, y: 0.5}
 --- !u!114 &1881870077
 MonoBehaviour:
@@ -4194,7 +4215,7 @@ MonoBehaviour:
   m_StartAxis: 0
   m_CellSize: {x: 320, y: 466}
   m_Spacing: {x: 17, y: 20}
-  m_Constraint: 1
+  m_Constraint: 0
   m_ConstraintCount: 6
 --- !u!1 &2075370449
 GameObject:

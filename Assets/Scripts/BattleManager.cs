@@ -15,6 +15,14 @@ public class BattleManager : MonoBehaviour
     public enum TurnState { DrawPhase, MainPhase, BattlePhase, EndPhase, GameOver }
     public TurnState currentState;
 
+    public bool IsMultiplayer => MatchSessionConfig.IsMultiplayer;
+    public string LocalDisplayName => MatchSessionConfig.GetLocalDisplayName();
+    public string OpponentDisplayName => MatchSessionConfig.GetOpponentDisplayName();
+
+    public int LocalDeckCount => IsMultiplayer ? networkMyDeckCount : playerDeck.Count;
+    public int OpponentDeckCount => IsMultiplayer ? networkOpponentDeckCount : aiDeck.Count;
+    public int OpponentHandCount => IsMultiplayer ? networkOpponentHandCount : aiHand.Count;
+
     [Header("Cấu hình luật đấu")]
     public int startingLP = 4000;
     public CardDatabaseSO cardDatabase;
@@ -83,6 +91,21 @@ public class BattleManager : MonoBehaviour
     private TextMeshProUGUI trapPromptText;
     private bool waitingTrapDecision = false;
     private bool playerAcceptedTrap = false;
+
+    // Trạng thái đồng bộ Multiplayer (Bước 3, 4, 5)
+    private int networkMyDeckCount = 0;
+    private int networkOpponentDeckCount = 0;
+    private int networkOpponentHandCount = 0;
+    private int lastAppliedSnapshotSeq = 0;
+    private bool hasAppliedInitialSnapshot = false;
+    private int activeNetworkPromptId = 0;
+    private int lastOpenedPromptId = -1;
+    private bool isNetworkPromptOpen = false;
+    private bool opponentLeftMultiplayerMatch = false;
+    private readonly bool[] networkMySpellCanReact = new bool[Player.ZoneCount];
+    private readonly string[] networkMySpellReactHint = new string[Player.ZoneCount];
+    private Button endTurnButton;
+    private TextMeshProUGUI endTurnButtonText;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void AutoBootstrapBattleScene()
@@ -312,7 +335,8 @@ public class BattleManager : MonoBehaviour
             }
         }
 
-        if (GameObject.Find("EndTurnButton") == null)
+        GameObject existingEndBtn = GameObject.Find("EndTurnButton");
+        if (existingEndBtn == null)
         {
             GameObject btnObj = new GameObject("EndTurnButton", typeof(RectTransform), typeof(Image), typeof(Button));
             btnObj.transform.SetParent(canvas.transform, false);
@@ -324,7 +348,8 @@ public class BattleManager : MonoBehaviour
             btnRT.sizeDelta = new Vector2(155f, 56f);
 
             btnObj.GetComponent<Image>().color = new Color(0.8f, 0.25f, 0.15f, 0.95f);
-            btnObj.GetComponent<Button>().onClick.AddListener(EndPlayerTurn);
+            endTurnButton = btnObj.GetComponent<Button>();
+            endTurnButton.onClick.AddListener(EndPlayerTurn);
 
             GameObject txtObj = new GameObject("Text", typeof(RectTransform), typeof(TextMeshProUGUI));
             txtObj.transform.SetParent(btnObj.transform, false);
@@ -334,12 +359,17 @@ public class BattleManager : MonoBehaviour
             txtRT.offsetMin = Vector2.zero;
             txtRT.offsetMax = Vector2.zero;
 
-            TextMeshProUGUI btnText = txtObj.GetComponent<TextMeshProUGUI>();
-            btnText.text = "END TURN";
-            btnText.fontSize = 20;
-            btnText.fontStyle = FontStyles.Bold;
-            btnText.alignment = TextAlignmentOptions.Center;
-            btnText.color = Color.white;
+            endTurnButtonText = txtObj.GetComponent<TextMeshProUGUI>();
+            endTurnButtonText.text = "END TURN";
+            endTurnButtonText.fontSize = 20;
+            endTurnButtonText.fontStyle = FontStyles.Bold;
+            endTurnButtonText.alignment = TextAlignmentOptions.Center;
+            endTurnButtonText.color = Color.white;
+        }
+        else
+        {
+            endTurnButton = existingEndBtn.GetComponent<Button>();
+            endTurnButtonText = existingEndBtn.GetComponentInChildren<TextMeshProUGUI>();
         }
 
         if (gameOverPanel == null)
@@ -406,16 +436,30 @@ public class BattleManager : MonoBehaviour
 
             CreatePopupButton(trapPromptPanel.transform, "KÍCH HOẠT", new Vector2(-105f, -45f), new Color(0.78f, 0.18f, 0.55f, 1f), () =>
             {
-                playerAcceptedTrap = true;
-                waitingTrapDecision = false;
                 trapPromptPanel.SetActive(false);
+                if (IsMultiplayer)
+                {
+                    SubmitMultiplayerPromptChoice(1);
+                }
+                else
+                {
+                    playerAcceptedTrap = true;
+                    waitingTrapDecision = false;
+                }
             });
 
             CreatePopupButton(trapPromptPanel.transform, "BỎ QUA", new Vector2(105f, -45f), new Color(0.32f, 0.32f, 0.38f, 1f), () =>
             {
-                playerAcceptedTrap = false;
-                waitingTrapDecision = false;
                 trapPromptPanel.SetActive(false);
+                if (IsMultiplayer)
+                {
+                    SubmitMultiplayerPromptChoice(0);
+                }
+                else
+                {
+                    playerAcceptedTrap = false;
+                    waitingTrapDecision = false;
+                }
             });
 
             trapPromptPanel.SetActive(false);
@@ -465,7 +509,23 @@ public class BattleManager : MonoBehaviour
         if (gameOverPanel != null) gameOverPanel.SetActive(false);
         if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
         CacheAllCardSprites();
-        InitializeBattle();
+
+        if (IsMultiplayer)
+        {
+            InitializeMultiplayerWaitState();
+        }
+        else
+        {
+            InitializeBattle();
+        }
+    }
+
+    void OnDestroy()
+    {
+        if (MultiplayerLobbyManager.Instance != null)
+        {
+            MultiplayerLobbyManager.Instance.OnMatchDisconnect -= HandleMultiplayerDisconnect;
+        }
     }
 
     void CacheAllCardSprites()
@@ -535,6 +595,640 @@ public class BattleManager : MonoBehaviour
         if (cleanTrapSpriteCache.TryGetValue(cleanKey, out Sprite t4)) return t4;
 
         return null;
+    }
+
+    public CardData BuildCardDataByName(string cardName)
+    {
+        return CreateCardData(cardName);
+    }
+
+    public List<CardData> BuildDeckFromJson(string deckJson)
+    {
+        List<CardData> deck = new List<CardData>();
+        if (string.IsNullOrWhiteSpace(deckJson)) return deck;
+
+        DeckSaveWrapper wrapper = JsonUtility.FromJson<DeckSaveWrapper>(deckJson);
+        if (wrapper == null || wrapper.cards == null) return deck;
+
+        foreach (var item in wrapper.cards)
+        {
+            if (item == null || string.IsNullOrWhiteSpace(item.cardName) || item.count <= 0) continue;
+            for (int i = 0; i < item.count; i++)
+            {
+                deck.Add(CreateCardData(item.cardName));
+            }
+        }
+
+        return deck;
+    }
+
+    void InitializeMultiplayerWaitState()
+    {
+        isGraveyardSelectionOpen = false;
+        playerDeck.Clear();
+        aiDeck.Clear();
+        playerHand.Clear();
+        aiHand.Clear();
+        playerGraveyard.Clear();
+        aiGraveyard.Clear();
+
+        Array.Clear(playerSpellZones, 0, playerSpellZones.Length);
+        Array.Clear(playerSpellFaceDown, 0, playerSpellFaceDown.Length);
+        Array.Clear(aiSpellZones, 0, aiSpellZones.Length);
+        Array.Clear(aiSpellFaceDown, 0, aiSpellFaceDown.Length);
+
+        humanPlayer = new Player(LocalDisplayName) { lifePoints = startingLP };
+        aiPlayer = new Player(OpponentDisplayName) { lifePoints = startingLP };
+        displayedPlayerLP = startingLP;
+        displayedAILP = startingLP;
+
+        if (playerLPDamageText != null) playerLPDamageText.gameObject.SetActive(false);
+        if (aiLPDamageText != null) aiLPDamageText.gameObject.SetActive(false);
+
+        // Khởi tạo Duel giữ chỗ để BattleAutoBoard không bị null khi chờ Bước 3 đồng bộ Snapshot
+        duel = new Duel(humanPlayer, aiPlayer);
+        currentState = TurnState.DrawPhase;
+        lastAppliedSnapshotSeq = 0;
+        hasAppliedInitialSnapshot = false;
+        opponentLeftMultiplayerMatch = false;
+        networkMyDeckCount = MatchSessionConfig.LocalIsHost ? MatchSessionConfig.HostDeckCount : MatchSessionConfig.ClientDeckCount;
+        networkOpponentDeckCount = MatchSessionConfig.LocalIsHost ? MatchSessionConfig.ClientDeckCount : MatchSessionConfig.HostDeckCount;
+        networkOpponentHandCount = 0;
+
+        UpdateLPUI();
+        UpdateDeckCountUI();
+        EnsureMultiplayerLeaveButton();
+        RefreshEndTurnButtonState();
+
+        if (MultiplayerLobbyManager.Instance != null)
+        {
+            MultiplayerLobbyManager.Instance.OnMatchDisconnect -= HandleMultiplayerDisconnect;
+            MultiplayerLobbyManager.Instance.OnMatchDisconnect += HandleMultiplayerDisconnect;
+        }
+
+        if (!MatchSessionConfig.LocalIsHost)
+        {
+            SetStatus($"Đang nhận trạng thái bàn đấu khởi đầu từ Host ({OpponentDisplayName})...");
+        }
+
+        // Khởi chạy NetworkDuelController để rút 5 lá mở màn và đồng bộ Snapshot (Bước 3)
+        NetworkDuelController.EnsureInstance().InitializeForBattleScene(this);
+    }
+
+    public void ApplyNetworkSnapshot(MatchStateSnapshot snap)
+    {
+        if (snap == null) return;
+        if (hasAppliedInitialSnapshot && snap.snapshotSeq < lastAppliedSnapshotSeq) return;
+
+        lastAppliedSnapshotSeq = snap.snapshotSeq;
+
+        if (humanPlayer == null) humanPlayer = new Player(snap.myName) { lifePoints = snap.myLP };
+        if (aiPlayer == null) aiPlayer = new Player(snap.opponentName) { lifePoints = snap.opponentLP };
+        if (duel == null) duel = new Duel(humanPlayer, aiPlayer);
+
+        humanPlayer.name = string.IsNullOrWhiteSpace(snap.myName) ? LocalDisplayName : snap.myName;
+        aiPlayer.name = string.IsNullOrWhiteSpace(snap.opponentName) ? OpponentDisplayName : snap.opponentName;
+
+        int prevMyLP = humanPlayer.lifePoints;
+        int prevOppLP = aiPlayer.lifePoints;
+        humanPlayer.lifePoints = snap.myLP;
+        aiPlayer.lifePoints = snap.opponentLP;
+
+        if (snap.isRematchReset || (!snap.isGameOver && gameOverPanel != null && gameOverPanel.activeSelf))
+        {
+            if (gameOverPanel != null) gameOverPanel.SetActive(false);
+            if (playerLPCoroutine != null) { StopCoroutine(playerLPCoroutine); playerLPCoroutine = null; }
+            if (aiLPCoroutine != null) { StopCoroutine(aiLPCoroutine); aiLPCoroutine = null; }
+            if (playerLPDamageText != null) playerLPDamageText.gameObject.SetActive(false);
+            if (aiLPDamageText != null) aiLPDamageText.gameObject.SetActive(false);
+            displayedPlayerLP = snap.myLP;
+            displayedAILP = snap.opponentLP;
+            UpdateLPUI();
+        }
+        else if (!hasAppliedInitialSnapshot)
+        {
+            displayedPlayerLP = snap.myLP;
+            displayedAILP = snap.opponentLP;
+            UpdateLPUI();
+        }
+        else
+        {
+            if (snap.myLP != prevMyLP)
+            {
+                int dmg = Mathf.Max(0, prevMyLP - snap.myLP);
+                HandleDamage(humanPlayer, dmg);
+            }
+            if (snap.opponentLP != prevOppLP)
+            {
+                int dmg = Mathf.Max(0, prevOppLP - snap.opponentLP);
+                HandleDamage(aiPlayer, dmg);
+            }
+        }
+
+        humanPlayer.normalSummonUsed = snap.myNormalSummonUsed;
+        humanPlayer.swordsBlockTurnsRemaining = snap.mySwordsBlockTurns;
+        aiPlayer.normalSummonUsed = snap.opponentNormalSummonUsed;
+        aiPlayer.swordsBlockTurnsRemaining = snap.opponentSwordsBlockTurns;
+
+        // Đồng bộ lượt: players[0] luôn là humanPlayer (bên dưới), players[1] luôn là aiPlayer (đối thủ bên trên)
+        duel.turnCount = Mathf.Max(1, snap.turnCount);
+        duel.currentIndex = snap.isMyTurn ? 0 : 1;
+        currentState = (TurnState)snap.turnState;
+
+        networkMyDeckCount = snap.myDeckCount;
+        networkOpponentDeckCount = snap.opponentDeckCount;
+        networkOpponentHandCount = snap.opponentHandCount;
+
+        // 1. Tay bài của mình
+        playerHand.Clear();
+        if (snap.myHandCardNames != null)
+        {
+            foreach (string cName in snap.myHandCardNames)
+            {
+                if (!string.IsNullOrEmpty(cName))
+                {
+                    playerHand.Add(CreateCardData(cName));
+                }
+            }
+        }
+
+        // Tay bài đối thủ (chỉ giữ số lượng ẩn danh)
+        aiHand.Clear();
+        for (int i = 0; i < snap.opponentHandCount; i++)
+        {
+            aiHand.Add(new CardData("HiddenCard", null, 0, 0, 1, "Lá bài trên tay đối thủ."));
+        }
+
+        // 2. Mộ bài 2 bên
+        playerGraveyard.Clear();
+        if (snap.myGraveyardCardNames != null)
+        {
+            foreach (string cName in snap.myGraveyardCardNames)
+            {
+                if (!string.IsNullOrEmpty(cName)) playerGraveyard.Add(CreateCardData(cName));
+            }
+        }
+
+        aiGraveyard.Clear();
+        if (snap.opponentGraveyardCardNames != null)
+        {
+            foreach (string cName in snap.opponentGraveyardCardNames)
+            {
+                if (!string.IsNullOrEmpty(cName)) aiGraveyard.Add(CreateCardData(cName));
+            }
+        }
+
+        // 3. 5 ô Quái thú của mình & đối thủ
+        ApplySnapshotMonsterZones(humanPlayer, snap.myMonsters, isOpponent: false);
+        ApplySnapshotMonsterZones(aiPlayer, snap.opponentMonsters, isOpponent: true);
+
+        // 4. 5 ô Phép/Bẫy của mình & đối thủ
+        ApplySnapshotSpellZones(playerSpellZones, playerSpellFaceDown, snap.mySpells, isOpponent: false);
+        ApplySnapshotSpellZones(aiSpellZones, aiSpellFaceDown, snap.opponentSpells, isOpponent: true);
+
+        hasAppliedInitialSnapshot = true;
+
+        UpdateDeckCountUI();
+        RefreshEndTurnButtonState();
+
+        if (BattleAutoBoard.Instance != null)
+        {
+            BattleAutoBoard.Instance.ForceRefreshHand();
+        }
+
+        if (snap.sfxList != null && snap.sfxList.Count > 0)
+        {
+            foreach (string sfx in snap.sfxList)
+            {
+                if (!string.IsNullOrEmpty(sfx) && sfx != "Damage")
+                {
+                    PlayBattleSFX(sfx);
+                }
+            }
+        }
+        else if (!string.IsNullOrEmpty(snap.sfxToPlay) && snap.sfxToPlay != "Damage")
+        {
+            PlayBattleSFX(snap.sfxToPlay);
+        }
+
+        if (!string.IsNullOrEmpty(snap.statusMessage))
+        {
+            SetStatus(snap.statusMessage);
+        }
+
+        // Xử lý Prompt bất đồng bộ (Bước 5: FLIP chọn Mộ hoặc Hỏi kích hoạt Bẫy Magical Hats)
+        ApplySnapshotPendingPrompt(snap);
+
+        if (snap.isGameOver)
+        {
+            ShowMultiplayerGameOver(snap.didLocalWin, snap.gameOverReason);
+        }
+    }
+
+    private void ApplySnapshotPendingPrompt(MatchStateSnapshot snap)
+    {
+        activeNetworkPromptId = snap.pendingPromptId;
+        NetPendingPromptType pType = (NetPendingPromptType)snap.pendingPromptType;
+
+        if (pType == NetPendingPromptType.None || snap.isGameOver)
+        {
+            if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
+            if (isNetworkPromptOpen)
+            {
+                isNetworkPromptOpen = false;
+                isGraveyardSelectionOpen = false;
+                if (BattleAutoBoard.Instance != null)
+                {
+                    BattleAutoBoard.Instance.CloseGraveyardModalIfOpen();
+                    BattleAutoBoard.Instance.CloseDefenseReactionModalIfOpen();
+                }
+            }
+            return;
+        }
+
+        if (!snap.isPromptForMe)
+        {
+            if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
+            if (BattleAutoBoard.Instance != null)
+            {
+                BattleAutoBoard.Instance.CloseDefenseReactionModalIfOpen();
+            }
+            return;
+        }
+
+        if (pType == NetPendingPromptType.FlipSelectGraveyardToDeck)
+        {
+            if (!isNetworkPromptOpen || lastOpenedPromptId != snap.pendingPromptId)
+            {
+                isNetworkPromptOpen = true;
+                lastOpenedPromptId = snap.pendingPromptId;
+                isGraveyardSelectionOpen = true;
+
+                if (BattleAutoBoard.Instance != null && playerGraveyard.Count > 0)
+                {
+                    BattleAutoBoard.Instance.OpenGraveyardSelection(
+                        playerGraveyard,
+                        gyIndex => SubmitMultiplayerPromptChoice(gyIndex),
+                        customTitle: string.IsNullOrEmpty(snap.promptTitle)
+                            ? "[FLIP] CHỌN 1 LÁ TRONG MỘ TRẢ VỀ DECK"
+                            : snap.promptTitle
+                    );
+                }
+                else
+                {
+                    SubmitMultiplayerPromptChoice(0);
+                }
+            }
+        }
+        else if (pType == NetPendingPromptType.TrapMagicalHats)
+        {
+            if (!isNetworkPromptOpen || lastOpenedPromptId != snap.pendingPromptId)
+            {
+                isNetworkPromptOpen = true;
+                lastOpenedPromptId = snap.pendingPromptId;
+                if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
+
+                if (BattleAutoBoard.Instance != null)
+                {
+                    string modalTitle = string.IsNullOrEmpty(snap.promptTitle)
+                        ? "ĐỐI THỦ TẤN CÔNG! CHỌN 1 LÁ BÀI PHÉP / BẪY ĐANG ÚP ĐỂ KÍCH HOẠT HOẶC BỎ QUA"
+                        : snap.promptTitle;
+
+                    BattleAutoBoard.Instance.OpenDefenseReactionModal(
+                        modalTitle,
+                        chosenSpellZone => HandleMultiplayerDefenseReactionZonePicked(chosenSpellZone)
+                    );
+                }
+                else
+                {
+                    SubmitMultiplayerDefenseReaction(-1, -1);
+                }
+            }
+        }
+    }
+
+    private void HandleMultiplayerDefenseReactionZonePicked(int chosenSpellZone)
+    {
+        if (chosenSpellZone < 0 || chosenSpellZone >= Player.ZoneCount)
+        {
+            SubmitMultiplayerDefenseReaction(-1, -1);
+            return;
+        }
+
+        CardData chosenCard = playerSpellZones[chosenSpellZone];
+        if (chosenCard != null && chosenCard.spellEffect == SpellEffectType.ReviveFromGraveyard)
+        {
+            if (BattleAutoBoard.Instance != null && playerGraveyard.Any(c => c.cardType == CardType.Monster))
+            {
+                isGraveyardSelectionOpen = true;
+                SetStatus($"[{chosenCard.cardName}] Chọn 1 quái thú trong Mộ bài để hồi sinh ngay!");
+                BattleAutoBoard.Instance.OpenGraveyardSelection(
+                    playerGraveyard,
+                    gyIndex =>
+                    {
+                        isGraveyardSelectionOpen = false;
+                        SubmitMultiplayerDefenseReaction(chosenSpellZone, gyIndex);
+                    },
+                    customTitle: $"[{chosenCard.cardName}] CHỌN QUÁI THÚ TRONG MỘ ĐỂ HỒI SINH",
+                    filter: c => c.cardType == CardType.Monster
+                );
+                return;
+            }
+        }
+
+        SubmitMultiplayerDefenseReaction(chosenSpellZone, -1);
+    }
+
+    public void SubmitMultiplayerDefenseReaction(int chosenSpellZone, int graveyardTargetIndex = -1)
+    {
+        isNetworkPromptOpen = false;
+        isGraveyardSelectionOpen = false;
+        if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
+        if (BattleAutoBoard.Instance != null)
+        {
+            BattleAutoBoard.Instance.CloseDefenseReactionModalIfOpen();
+        }
+
+        if (NetworkDuelController.Instance != null)
+        {
+            NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+            {
+                actionType = (int)NetDuelActionType.RespondPromptChoice,
+                promptId = activeNetworkPromptId,
+                myZoneIndex = chosenSpellZone,
+                graveyardTargetIndex = graveyardTargetIndex
+            });
+        }
+    }
+
+    public void SubmitMultiplayerPromptChoice(int choiceValue)
+    {
+        isNetworkPromptOpen = false;
+        isGraveyardSelectionOpen = false;
+        if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
+        if (BattleAutoBoard.Instance != null)
+        {
+            BattleAutoBoard.Instance.CloseDefenseReactionModalIfOpen();
+        }
+
+        if (NetworkDuelController.Instance != null)
+        {
+            NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+            {
+                actionType = (int)NetDuelActionType.RespondPromptChoice,
+                promptId = activeNetworkPromptId,
+                myZoneIndex = choiceValue,
+                graveyardTargetIndex = choiceValue
+            });
+        }
+    }
+
+    public void ShowMultiplayerGameOver(bool didLocalWin, string reason)
+    {
+        currentState = TurnState.GameOver;
+        isGraveyardSelectionOpen = false;
+
+        if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
+        RefreshEndTurnButtonState();
+
+        PlayBattleSFX(didLocalWin ? "Win" : "Lose");
+
+        string title = didLocalWin ? "CHIẾN THẮNG!" : "THẤT BẠI!";
+        SetStatus($"{title} ({reason})");
+
+        if (gameOverPanel != null)
+        {
+            gameOverPanel.SetActive(true);
+            if (gameOverTitleText != null) gameOverTitleText.text = title;
+            if (gameOverReasonText != null) gameOverReasonText.text = reason;
+        }
+    }
+
+    private void ApplySnapshotMonsterZones(Player targetPlayer, NetMonsterSlotDto[] slots, bool isOpponent)
+    {
+        for (int i = 0; i < Player.ZoneCount; i++)
+        {
+            if (slots == null || i >= slots.Length || slots[i] == null || !slots[i].hasCard)
+            {
+                targetPlayer.monsterZones[i] = null;
+                continue;
+            }
+
+            NetMonsterSlotDto dto = slots[i];
+            BattlePosition pos = (BattlePosition)dto.position;
+            CardData cardData;
+
+            if (isOpponent && pos == BattlePosition.FaceDownDefense && string.IsNullOrEmpty(dto.cardName))
+            {
+                cardData = new CardData("Quái thú úp", null, 0, 0, 4, "Quái thú đang đặt úp của đối thủ.");
+            }
+            else if (dto.isMagicalHatDecoy && string.IsNullOrEmpty(dto.cardName))
+            {
+                cardData = new CardData("Mũ Tơ Ma Thuật", null, 0, 0, 1, "Quái thú ảo ảnh (0/0) từ Mũ Tơ Ma Thuật.");
+            }
+            else
+            {
+                cardData = CreateCardData(dto.cardName);
+            }
+
+            targetPlayer.monsterZones[i] = new MonsterCard
+            {
+                data = cardData,
+                owner = targetPlayer,
+                zoneIndex = i,
+                position = pos,
+                atkModifier = dto.atkModifier,
+                defModifier = dto.defModifier,
+                summonedThisTurn = dto.summonedThisTurn,
+                hasAttacked = dto.hasAttacked,
+                positionChanged = dto.positionChanged,
+                faceUpEffectTriggered = dto.faceUpEffectTriggered,
+                isMagicalHatDecoy = dto.isMagicalHatDecoy
+            };
+        }
+    }
+
+    private void ApplySnapshotSpellZones(CardData[] targetZones, bool[] targetFaceDown, NetSpellSlotDto[] slots, bool isOpponent)
+    {
+        for (int i = 0; i < Player.ZoneCount; i++)
+        {
+            if (slots == null || i >= slots.Length || slots[i] == null || !slots[i].hasCard)
+            {
+                targetZones[i] = null;
+                targetFaceDown[i] = false;
+                if (!isOpponent)
+                {
+                    networkMySpellCanReact[i] = false;
+                    networkMySpellReactHint[i] = "";
+                }
+                continue;
+            }
+
+            NetSpellSlotDto dto = slots[i];
+            targetFaceDown[i] = dto.isFaceDown;
+            if (!isOpponent)
+            {
+                networkMySpellCanReact[i] = dto.canActivateInReaction;
+                networkMySpellReactHint[i] = dto.reactionHint ?? "";
+            }
+
+            if (isOpponent && dto.isFaceDown && string.IsNullOrEmpty(dto.cardName))
+            {
+                targetZones[i] = CardData.CreateSpell("Bài úp", null, SpellEffectType.None, 0, "Bài Phép/Bẫy đang đặt úp của đối thủ.");
+            }
+            else
+            {
+                targetZones[i] = CreateCardData(dto.cardName);
+            }
+        }
+    }
+
+    public bool CanPlayerSetCardReact(int spellZone, out string failReason)
+    {
+        failReason = "";
+        if (spellZone < 0 || spellZone >= Player.ZoneCount)
+        {
+            failReason = "Ô bài không hợp lệ.";
+            return false;
+        }
+
+        CardData card = playerSpellZones[spellZone];
+        if (card == null || !playerSpellFaceDown[spellZone])
+        {
+            failReason = "Lá bài không ở trạng thái đặt úp.";
+            return false;
+        }
+
+        if (IsMultiplayer)
+        {
+            failReason = networkMySpellReactHint[spellZone];
+            return networkMySpellCanReact[spellZone];
+        }
+
+        bool deckHasSpellTrap = playerDeck.Any(c => c != null && c.IsSpellOrTrap);
+        bool gyHasMonster = playerGraveyard.Any(c => c != null && c.cardType == CardType.Monster);
+
+        return Duel.CanActivateSpellOrTrap(
+            card,
+            humanPlayer,
+            aiPlayer,
+            playerDeck.Count,
+            deckHasSpellTrap,
+            gyHasMonster,
+            out failReason
+        );
+    }
+
+    public bool HasAnyActivatablePlayerSetCardForReaction()
+    {
+        for (int i = 0; i < Player.ZoneCount; i++)
+        {
+            if (CanPlayerSetCardReact(i, out _)) return true;
+        }
+        return false;
+    }
+
+    private void RefreshEndTurnButtonState()
+    {
+        if (endTurnButton == null) return;
+
+        if (!IsMultiplayer)
+        {
+            endTurnButton.interactable = true;
+            if (endTurnButtonText != null) endTurnButtonText.text = "END TURN";
+            Image img = endTurnButton.GetComponent<Image>();
+            if (img != null) img.color = new Color(0.8f, 0.25f, 0.15f, 0.95f);
+            return;
+        }
+
+        bool isMyTurn = (duel != null && duel.Current == humanPlayer && currentState != TurnState.GameOver && hasAppliedInitialSnapshot);
+        endTurnButton.interactable = isMyTurn;
+        if (endTurnButtonText != null)
+        {
+            endTurnButtonText.text = isMyTurn ? "END TURN" : "LƯỢT ĐỐI THỦ";
+        }
+        Image btnImg = endTurnButton.GetComponent<Image>();
+        if (btnImg != null)
+        {
+            btnImg.color = isMyTurn
+                ? new Color(0.8f, 0.25f, 0.15f, 0.95f)
+                : new Color(0.28f, 0.3f, 0.35f, 0.8f);
+        }
+    }
+
+    void EnsureMultiplayerLeaveButton()
+    {
+        Canvas canvas = GetBattleCanvas();
+        if (canvas == null || GameObject.Find("MultiplayerLeaveButton") != null) return;
+
+        GameObject btnObj = new GameObject("MultiplayerLeaveButton", typeof(RectTransform), typeof(Image), typeof(Button));
+        btnObj.transform.SetParent(canvas.transform, false);
+        RectTransform rt = btnObj.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(1f, 1f);
+        rt.anchorMax = new Vector2(1f, 1f);
+        rt.pivot = new Vector2(1f, 1f);
+        rt.anchoredPosition = new Vector2(-18f, -14f);
+        rt.sizeDelta = new Vector2(145f, 40f);
+
+        btnObj.GetComponent<Image>().color = new Color(0.68f, 0.2f, 0.2f, 0.92f);
+        btnObj.GetComponent<Button>().onClick.AddListener(ReturnToMainMenu);
+
+        GameObject txtObj = new GameObject("Text", typeof(RectTransform), typeof(TextMeshProUGUI));
+        txtObj.transform.SetParent(btnObj.transform, false);
+        RectTransform txtRT = txtObj.GetComponent<RectTransform>();
+        txtRT.anchorMin = Vector2.zero;
+        txtRT.anchorMax = Vector2.one;
+        txtRT.offsetMin = Vector2.zero;
+        txtRT.offsetMax = Vector2.zero;
+
+        TextMeshProUGUI txt = txtObj.GetComponent<TextMeshProUGUI>();
+        txt.text = "RỜI TRẬN";
+        txt.fontSize = 16;
+        txt.fontStyle = FontStyles.Bold;
+        txt.alignment = TextAlignmentOptions.Center;
+        txt.color = Color.white;
+        txt.raycastTarget = false;
+    }
+
+    void HandleMultiplayerDisconnect(string reason)
+    {
+        NotifyOpponentLeftMatch(string.IsNullOrWhiteSpace(reason)
+            ? $"{OpponentDisplayName} đã mất kết nối!"
+            : reason);
+    }
+
+    public void NotifyOpponentLeftMatch(string reason)
+    {
+        if (opponentLeftMultiplayerMatch) return;
+        opponentLeftMultiplayerMatch = true;
+        isNetworkPromptOpen = false;
+        isGraveyardSelectionOpen = false;
+
+        if (trapPromptPanel != null) trapPromptPanel.SetActive(false);
+        if (BattleAutoBoard.Instance != null)
+        {
+            BattleAutoBoard.Instance.CloseGraveyardModalIfOpen();
+            BattleAutoBoard.Instance.CloseDefenseReactionModalIfOpen();
+        }
+
+        if (currentState != TurnState.GameOver)
+        {
+            ShowMultiplayerGameOver(didLocalWin: true, reason: reason);
+        }
+        else
+        {
+            string leaveNotice = $"{reason} (Bấm 'VỀ MENU' để thoát)";
+            SetStatus(leaveNotice);
+            UpdateGameOverReasonIfVisible(leaveNotice);
+        }
+    }
+
+    public void UpdateGameOverReasonIfVisible(string msg)
+    {
+        if (gameOverPanel != null && gameOverPanel.activeSelf && gameOverReasonText != null && !string.IsNullOrEmpty(msg))
+        {
+            gameOverReasonText.text = msg;
+        }
     }
 
     CardData CreateCardData(string cardName)
@@ -711,7 +1405,12 @@ public class BattleManager : MonoBehaviour
     public bool PlayerActivateSpellFromHand(int handIndex, int preferredSpellZone = -1)
     {
         if (isGraveyardSelectionOpen) return false;
-        if (currentState != TurnState.MainPhase || duel.Current != humanPlayer) return false;
+        if (currentState != TurnState.MainPhase || duel == null || duel.Current != humanPlayer)
+        {
+            if (IsMultiplayer && duel != null && duel.Current != humanPlayer)
+                SetStatus($"Chưa tới lượt của bạn! Đang là lượt của {OpponentDisplayName}.");
+            return false;
+        }
         if (handIndex < 0 || handIndex >= playerHand.Count) return false;
 
         CardData spellCard = playerHand[handIndex];
@@ -729,6 +1428,12 @@ public class BattleManager : MonoBehaviour
             return false;
         }
 
+        if (spellCard.spellEffect == SpellEffectType.SwordsOfRevealingLight && aiPlayer != null && aiPlayer.swordsBlockTurnsRemaining > 0)
+        {
+            SetStatus($"[{spellCard.cardName}] đang còn hiệu lực khóa {aiPlayer.name} (còn {aiPlayer.swordsBlockTurnsRemaining} lượt), không thể kích hoạt chồng thêm!");
+            return false;
+        }
+
         if (spellCard.spellEffect == SpellEffectType.ReviveFromGraveyard)
         {
             if (humanPlayer.FirstEmptyZone() < 0)
@@ -740,6 +1445,36 @@ public class BattleManager : MonoBehaviour
             {
                 SetStatus("Không có quái thú nào trong Mộ bài để hồi sinh!");
                 return false;
+            }
+
+            if (IsMultiplayer)
+            {
+                isGraveyardSelectionOpen = true;
+                SetStatus($"[{spellCard.cardName}] Chọn 1 quái thú trong Phần Mộ để hồi sinh!");
+
+                if (BattleAutoBoard.Instance != null)
+                {
+                    BattleAutoBoard.Instance.OpenGraveyardSelection(
+                        playerGraveyard,
+                        gyIndex =>
+                        {
+                            isGraveyardSelectionOpen = false;
+                            if (NetworkDuelController.Instance != null)
+                            {
+                                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                                {
+                                    actionType = (int)NetDuelActionType.ActivateSpellFromHand,
+                                    handIndex = handIndex,
+                                    preferredZone = preferredSpellZone,
+                                    graveyardTargetIndex = gyIndex
+                                });
+                            }
+                        },
+                        customTitle: $"[{spellCard.cardName}] CHỌN QUÁI THÚ TRONG MỘ ĐỂ HỒI SINH",
+                        filter: c => c.cardType == CardType.Monster
+                    );
+                }
+                return true;
             }
 
             playerHand.RemoveAt(handIndex);
@@ -754,6 +1489,21 @@ public class BattleManager : MonoBehaviour
 
             OpenReviveGraveyardSelector(spellZone, spellCard);
             return true;
+        }
+
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.ActivateSpellFromHand,
+                    handIndex = handIndex,
+                    preferredZone = preferredSpellZone
+                });
+                return true;
+            }
+            return false;
         }
 
         if (duel.ActivateSpell(humanPlayer, spellCard))
@@ -774,7 +1524,12 @@ public class BattleManager : MonoBehaviour
     public bool PlayerSetSpellFromHand(int handIndex, int preferredSpellZone = -1)
     {
         if (isGraveyardSelectionOpen) return false;
-        if (currentState != TurnState.MainPhase || duel.Current != humanPlayer) return false;
+        if (currentState != TurnState.MainPhase || duel == null || duel.Current != humanPlayer)
+        {
+            if (IsMultiplayer && duel != null && duel.Current != humanPlayer)
+                SetStatus($"Chưa tới lượt của bạn! Đang là lượt của {OpponentDisplayName}.");
+            return false;
+        }
         if (handIndex < 0 || handIndex >= playerHand.Count) return false;
 
         CardData spellCard = playerHand[handIndex];
@@ -784,6 +1539,21 @@ public class BattleManager : MonoBehaviour
         if (spellZone < 0)
         {
             SetStatus("Hết ô bài Phép/Bẫy trên sân!");
+            return false;
+        }
+
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.SetSpellTrapFromHand,
+                    handIndex = handIndex,
+                    preferredZone = preferredSpellZone
+                });
+                return true;
+            }
             return false;
         }
 
@@ -805,7 +1575,7 @@ public class BattleManager : MonoBehaviour
 
         if (spellCard.spellEffect == SpellEffectType.MagicalHats)
         {
-            if (duel.Current == humanPlayer || currentState != TurnState.BattlePhase)
+            if (duel == null || duel.Current == humanPlayer || currentState != TurnState.BattlePhase)
             {
                 SetStatus("Mũ Tơ Ma Thuật chỉ kích hoạt trong Battle Phase của đối thủ!");
                 return false;
@@ -813,7 +1583,13 @@ public class BattleManager : MonoBehaviour
         }
         else if (spellCard.cardType == CardType.Spell)
         {
-            if (currentState != TurnState.MainPhase || duel.Current != humanPlayer) return false;
+            if (currentState != TurnState.MainPhase || duel == null || duel.Current != humanPlayer) return false;
+        }
+
+        if (spellCard.spellEffect == SpellEffectType.SwordsOfRevealingLight && aiPlayer != null && aiPlayer.swordsBlockTurnsRemaining > 0)
+        {
+            SetStatus($"[{spellCard.cardName}] đang còn hiệu lực khóa {aiPlayer.name} (còn {aiPlayer.swordsBlockTurnsRemaining} lượt), không thể kích hoạt chồng thêm!");
+            return false;
         }
 
         if (spellCard.spellEffect == SpellEffectType.ReviveFromGraveyard)
@@ -829,10 +1605,53 @@ public class BattleManager : MonoBehaviour
                 return false;
             }
 
+            if (IsMultiplayer)
+            {
+                isGraveyardSelectionOpen = true;
+                SetStatus($"[{spellCard.cardName}] Chọn 1 quái thú trong Phần Mộ để hồi sinh!");
+
+                if (BattleAutoBoard.Instance != null)
+                {
+                    BattleAutoBoard.Instance.OpenGraveyardSelection(
+                        playerGraveyard,
+                        gyIndex =>
+                        {
+                            isGraveyardSelectionOpen = false;
+                            if (NetworkDuelController.Instance != null)
+                            {
+                                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                                {
+                                    actionType = (int)NetDuelActionType.ActivateSetSpellTrap,
+                                    myZoneIndex = spellZone,
+                                    graveyardTargetIndex = gyIndex
+                                });
+                            }
+                        },
+                        customTitle: $"[{spellCard.cardName}] CHỌN QUÁI THÚ TRONG MỘ ĐỂ HỒI SINH",
+                        filter: c => c.cardType == CardType.Monster
+                    );
+                }
+                return true;
+            }
+
             playerSpellFaceDown[spellZone] = false;
             PlayBattleSFX("Spell");
             OpenReviveGraveyardSelector(spellZone, spellCard);
             return true;
+        }
+
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.ActivateSetSpellTrap,
+                    myZoneIndex = spellZone
+                });
+                return true;
+            }
+            return false;
         }
 
         if (duel.ActivateSpell(humanPlayer, spellCard))
@@ -910,7 +1729,12 @@ public class BattleManager : MonoBehaviour
     public bool PlayerSummonFromHand(int handIndex, BattlePosition pos, List<int> tributeZoneIndices = null, int preferredZone = -1)
     {
         if (isGraveyardSelectionOpen) return false;
-        if (currentState != TurnState.MainPhase || duel.Current != humanPlayer) return false;
+        if (currentState != TurnState.MainPhase || duel == null || duel.Current != humanPlayer)
+        {
+            if (IsMultiplayer && duel != null && duel.Current != humanPlayer)
+                SetStatus($"Chưa tới lượt của bạn! Đang là lượt của {OpponentDisplayName}.");
+            return false;
+        }
         if (handIndex < 0 || handIndex >= playerHand.Count) return false;
 
         CardData cardToSummon = playerHand[handIndex];
@@ -928,6 +1752,23 @@ public class BattleManager : MonoBehaviour
             return pos == BattlePosition.FaceDownDefense
                 ? PlayerSetSpellFromHand(handIndex, preferredZone)
                 : PlayerActivateSpellFromHand(handIndex, preferredZone);
+        }
+
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.SummonMonster,
+                    handIndex = handIndex,
+                    position = (int)pos,
+                    preferredZone = preferredZone,
+                    tributeZones = tributeZoneIndices != null ? new List<int>(tributeZoneIndices) : new List<int>()
+                });
+                return true;
+            }
+            return false;
         }
 
         List<MonsterCard> tributes = new List<MonsterCard>();
@@ -956,8 +1797,22 @@ public class BattleManager : MonoBehaviour
     public bool PlayerChangePosition(int myZoneIndex)
     {
         if (isGraveyardSelectionOpen) return false;
-        if (currentState != TurnState.MainPhase || duel.Current != humanPlayer) return false;
+        if (currentState != TurnState.MainPhase || duel == null || duel.Current != humanPlayer) return false;
         if (myZoneIndex < 0 || myZoneIndex >= Player.ZoneCount) return false;
+
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.ChangeMonsterPosition,
+                    myZoneIndex = myZoneIndex
+                });
+                return true;
+            }
+            return false;
+        }
 
         return duel.ChangePosition(humanPlayer, humanPlayer.monsterZones[myZoneIndex]);
     }
@@ -965,7 +1820,7 @@ public class BattleManager : MonoBehaviour
     public void EnterBattlePhase()
     {
         if (isGraveyardSelectionOpen) return;
-        if (currentState != TurnState.MainPhase || duel.Current != humanPlayer) return;
+        if (currentState != TurnState.MainPhase || duel == null || duel.Current != humanPlayer) return;
         if (duel.turnCount == 1)
         {
             SetStatus("Không được tấn công ở lượt đầu tiên!");
@@ -977,6 +1832,18 @@ public class BattleManager : MonoBehaviour
             return;
         }
 
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.EnterBattlePhase
+                });
+            }
+            return;
+        }
+
         currentState = TurnState.BattlePhase;
         SetStatus("Lượt của bạn - Battle Phase");
     }
@@ -984,11 +1851,28 @@ public class BattleManager : MonoBehaviour
     public bool PlayerAttackMonster(int myZoneIndex, int enemyZoneIndex)
     {
         if (isGraveyardSelectionOpen) return false;
-        if (currentState == TurnState.MainPhase) EnterBattlePhase();
-        if (currentState != TurnState.BattlePhase || duel.Current != humanPlayer) return false;
-
+        if (duel == null || duel.Current != humanPlayer) return false;
         if (myZoneIndex < 0 || myZoneIndex >= Player.ZoneCount) return false;
         if (enemyZoneIndex < 0 || enemyZoneIndex >= Player.ZoneCount) return false;
+
+        if (IsMultiplayer)
+        {
+            if (currentState != TurnState.MainPhase && currentState != TurnState.BattlePhase) return false;
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.AttackMonster,
+                    myZoneIndex = myZoneIndex,
+                    targetOpponentZone = enemyZoneIndex
+                });
+                return true;
+            }
+            return false;
+        }
+
+        if (currentState == TurnState.MainPhase) EnterBattlePhase();
+        if (currentState != TurnState.BattlePhase || duel.Current != humanPlayer) return false;
 
         TryAITriggerMagicalHats();
 
@@ -998,10 +1882,26 @@ public class BattleManager : MonoBehaviour
     public bool PlayerDirectAttack(int myZoneIndex)
     {
         if (isGraveyardSelectionOpen) return false;
+        if (duel == null || duel.Current != humanPlayer) return false;
+        if (myZoneIndex < 0 || myZoneIndex >= Player.ZoneCount) return false;
+
+        if (IsMultiplayer)
+        {
+            if (currentState != TurnState.MainPhase && currentState != TurnState.BattlePhase) return false;
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.DirectAttack,
+                    myZoneIndex = myZoneIndex
+                });
+                return true;
+            }
+            return false;
+        }
+
         if (currentState == TurnState.MainPhase) EnterBattlePhase();
         if (currentState != TurnState.BattlePhase || duel.Current != humanPlayer) return false;
-
-        if (myZoneIndex < 0 || myZoneIndex >= Player.ZoneCount) return false;
 
         return duel.DirectAttack(humanPlayer, humanPlayer.monsterZones[myZoneIndex]);
     }
@@ -1009,7 +1909,19 @@ public class BattleManager : MonoBehaviour
     public void EndPlayerTurn()
     {
         if (isGraveyardSelectionOpen) return;
-        if (currentState == TurnState.GameOver || duel.IsGameOver || duel.Current != humanPlayer) return;
+        if (currentState == TurnState.GameOver || duel == null || duel.IsGameOver || duel.Current != humanPlayer) return;
+
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestAction(new NetDuelActionRequest
+                {
+                    actionType = (int)NetDuelActionType.EndTurn
+                });
+            }
+            return;
+        }
 
         currentState = TurnState.EndPhase;
         duel.EndTurn();
@@ -1163,7 +2075,7 @@ public class BattleManager : MonoBehaviour
             {
                 if (card.spellEffect == SpellEffectType.DestroyAllMonsters && aiPlayer.MonsterCount >= humanPlayer.MonsterCount)
                     continue;
-                if (card.spellEffect == SpellEffectType.SwordsOfRevealingLight && aiPlayer.swordsBlockTurnsRemaining > 0)
+                if (card.spellEffect == SpellEffectType.SwordsOfRevealingLight && humanPlayer.swordsBlockTurnsRemaining > 0)
                     continue;
 
                 int aiSpellZone = FindEmptySpellZone(isPlayer: false);
@@ -1208,60 +2120,61 @@ public class BattleManager : MonoBehaviour
             SetStatus("Lượt của AI - Battle Phase!");
             yield return new WaitForSeconds(0.5f);
 
-            bool aiHasAttacker = aiPlayer.Monsters.Any(m => m.CanAttack);
-            if (aiHasAttacker && CanActivateMagicalHats(isPlayer: true) && trapPromptPanel != null)
-            {
-                int trapZone = FindSetTrapZone(isPlayer: true, SpellEffectType.MagicalHats);
-                if (trapZone >= 0)
-                {
-                    CardData trapCard = playerSpellZones[trapZone];
-                    waitingTrapDecision = true;
-                    playerAcceptedTrap = false;
-                    trapPromptText.text = $"AI bước vào Battle Phase!\nBạn có muốn kích hoạt [{trapCard.cardName}] không?";
-                    trapPromptPanel.SetActive(true);
-
-                    yield return new WaitUntil(() => !waitingTrapDecision || currentState == TurnState.GameOver);
-
-                    if (playerAcceptedTrap && currentState != TurnState.GameOver)
-                    {
-                        PlayerActivateSetSpell(trapZone);
-                        yield return new WaitForSeconds(0.7f);
-                    }
-                }
-            }
-
             foreach (var attacker in aiPlayer.Monsters.ToList())
             {
                 if (duel.IsGameOver || aiPlayer.swordsBlockTurnsRemaining > 0) yield break;
-                if (!attacker.CanAttack) continue;
+                if (attacker == null || aiPlayer.monsterZones[attacker.zoneIndex] != attacker || !attacker.CanAttack) continue;
+
+                MonsterCard previewTarget = FindBestAITargetForAttacker(attacker);
+                if (humanPlayer.MonsterCount > 0 && previewTarget == null)
+                {
+                    // AI không có mục tiêu nào đánh thắng hoặc úp để đánh -> bỏ qua quái này
+                    continue;
+                }
+
+                // Khi AI tuyên bố tấn công: nếu người chơi có BẤT KỲ lá bài Phép/Bẫy nào đang úp có thể kích hoạt, mở Menu chọn lựa!
+                if (HasAnyActivatablePlayerSetCardForReaction() && BattleAutoBoard.Instance != null)
+                {
+                    int pickedZone = -1;
+                    waitingTrapDecision = true;
+
+                    string targetDesc = humanPlayer.MonsterCount == 0
+                        ? "trực tiếp vào LP của bạn"
+                        : (previewTarget != null && !previewTarget.IsFaceDown ? $"[{previewTarget.data.cardName}]" : "quái thú úp của bạn");
+
+                    BattleAutoBoard.Instance.OpenDefenseReactionModal(
+                        $"AI dùng [{attacker.data.cardName}] (ATK {attacker.Atk}) tấn công {targetDesc}!\nCHỌN 1 LÁ BÀI PHÉP / BẪY ĐANG ÚP ĐỂ KÍCH HOẠT HOẶC BỎ QUA",
+                        z =>
+                        {
+                            pickedZone = z;
+                            waitingTrapDecision = false;
+                        }
+                    );
+
+                    yield return new WaitUntil(() => !waitingTrapDecision || currentState == TurnState.GameOver);
+
+                    if (pickedZone >= 0 && currentState != TurnState.GameOver)
+                    {
+                        yield return StartCoroutine(ActivatePlayerSetCardInSingleplayerReactionRoutine(pickedZone));
+                    }
+                }
+
+                if (duel.IsGameOver || aiPlayer.swordsBlockTurnsRemaining > 0) yield break;
+                if (aiPlayer.monsterZones[attacker.zoneIndex] != attacker || !attacker.CanAttack) continue;
 
                 if (humanPlayer.MonsterCount == 0)
                 {
                     duel.DirectAttack(aiPlayer, attacker);
+                    yield return new WaitUntil(() => !isGraveyardSelectionOpen || currentState == TurnState.GameOver);
                     yield return new WaitForSeconds(0.7f);
                 }
                 else
                 {
-                    MonsterCard bestTarget = humanPlayer.Monsters
-                        .Where(t => !t.IsFaceDown && t.position == BattlePosition.FaceUpAttack && attacker.Atk > t.Atk)
-                        .OrderByDescending(t => t.Atk)
-                        .FirstOrDefault();
-
-                    if (bestTarget == null)
-                    {
-                        bestTarget = humanPlayer.Monsters
-                            .Where(t => !t.IsFaceDown && t.IsDefense && attacker.Atk > t.Def)
-                            .FirstOrDefault();
-                    }
-
-                    if (bestTarget == null)
-                    {
-                        bestTarget = humanPlayer.Monsters.FirstOrDefault(t => t.IsFaceDown);
-                    }
-
+                    MonsterCard bestTarget = FindBestAITargetForAttacker(attacker);
                     if (bestTarget != null)
                     {
                         duel.Attack(aiPlayer, attacker, bestTarget);
+                        yield return new WaitUntil(() => !isGraveyardSelectionOpen || currentState == TurnState.GameOver);
                         yield return new WaitForSeconds(0.7f);
                     }
                 }
@@ -1280,6 +2193,65 @@ public class BattleManager : MonoBehaviour
 
         duel.EndTurn();
         StartPlayerTurn();
+    }
+
+    private MonsterCard FindBestAITargetForAttacker(MonsterCard attacker)
+    {
+        if (attacker == null || humanPlayer == null) return null;
+
+        MonsterCard bestTarget = humanPlayer.Monsters
+            .Where(t => !t.IsFaceDown && t.position == BattlePosition.FaceUpAttack && attacker.Atk > t.Atk)
+            .OrderByDescending(t => t.Atk)
+            .FirstOrDefault();
+
+        if (bestTarget == null)
+        {
+            bestTarget = humanPlayer.Monsters
+                .Where(t => !t.IsFaceDown && t.IsDefense && attacker.Atk > t.Def)
+                .FirstOrDefault();
+        }
+
+        if (bestTarget == null)
+        {
+            bestTarget = humanPlayer.Monsters.FirstOrDefault(t => t.IsFaceDown);
+        }
+
+        return bestTarget;
+    }
+
+    private IEnumerator ActivatePlayerSetCardInSingleplayerReactionRoutine(int spellZone)
+    {
+        if (spellZone < 0 || spellZone >= Player.ZoneCount) yield break;
+
+        CardData spellCard = playerSpellZones[spellZone];
+        if (spellCard == null || !playerSpellFaceDown[spellZone]) yield break;
+
+        if (!CanPlayerSetCardReact(spellZone, out string failReason))
+        {
+            SetStatus($"Không thể kích hoạt [{spellCard.cardName}]: {failReason}");
+            yield break;
+        }
+
+        if (spellCard.spellEffect == SpellEffectType.ReviveFromGraveyard)
+        {
+            playerSpellFaceDown[spellZone] = false;
+            PlayBattleSFX("Spell");
+            OpenReviveGraveyardSelector(spellZone, spellCard);
+            yield return new WaitUntil(() => !isGraveyardSelectionOpen || currentState == TurnState.GameOver);
+            yield return new WaitForSeconds(0.7f);
+            yield break;
+        }
+
+        if (duel.ActivateSpell(humanPlayer, spellCard, allowOutOfTurnReaction: true))
+        {
+            playerSpellFaceDown[spellZone] = false;
+            if (spellCard.spellEffect != SpellEffectType.SwordsOfRevealingLight)
+            {
+                StartCoroutine(ClearSpellZoneAfterDelay(isPlayer: true, spellZone, spellCard, 0.9f));
+            }
+            yield return new WaitUntil(() => !isGraveyardSelectionOpen || currentState == TurnState.GameOver);
+            yield return new WaitForSeconds(0.75f);
+        }
     }
 
     void AISummonBestMonster()
@@ -1412,7 +2384,7 @@ public class BattleManager : MonoBehaviour
 
         for (int i = 0; i < Player.ZoneCount; i++)
         {
-            if (zones[i] != null && zones[i].spellEffect == SpellEffectType.SwordsOfRevealingLight)
+            if (zones[i] != null && !faceDowns[i] && zones[i].spellEffect == SpellEffectType.SwordsOfRevealingLight)
             {
                 gy.Add(zones[i]);
                 zones[i] = null;
@@ -1514,7 +2486,7 @@ public class BattleManager : MonoBehaviour
         if (isPlayer) playerLPCoroutine = null;
         else aiLPCoroutine = null;
 
-        if (targetLP <= 0 && currentState != TurnState.GameOver)
+        if (!IsMultiplayer && targetLP <= 0 && currentState != TurnState.GameOver)
         {
             string winner = isPlayer ? "AI" : "Player";
             string loserName = isPlayer ? humanPlayer.name : aiPlayer.name;
@@ -1559,6 +2531,22 @@ public class BattleManager : MonoBehaviour
 
     public void RestartBattle()
     {
+        if (IsMultiplayer)
+        {
+            if (opponentLeftMultiplayerMatch)
+            {
+                string msg = "Đối thủ đã rời trận. Hãy bấm 'VỀ MENU' để tạo hoặc vào phòng mới!";
+                SetStatus(msg);
+                UpdateGameOverReasonIfVisible(msg);
+                return;
+            }
+
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.RequestRematch();
+            }
+            return;
+        }
         Time.timeScale = 1f;
         SceneManager.LoadScene("BattleScene");
     }
@@ -1566,6 +2554,25 @@ public class BattleManager : MonoBehaviour
     public void ReturnToMainMenu()
     {
         Time.timeScale = 1f;
+        if (IsMultiplayer)
+        {
+            if (NetworkDuelController.Instance != null)
+            {
+                NetworkDuelController.Instance.NotifyLeavingMatch();
+            }
+            if (MultiplayerLobbyManager.Instance != null)
+            {
+                MultiplayerLobbyManager.Instance.LeaveRoom("Đã rời trận đấu 1v1.");
+            }
+            else
+            {
+                MatchSessionConfig.ResetToSingleplayer();
+            }
+        }
+        else
+        {
+            MatchSessionConfig.ResetToSingleplayer();
+        }
         SceneManager.LoadScene("SampleScene");
     }
 
@@ -1588,8 +2595,8 @@ public class BattleManager : MonoBehaviour
 
     void UpdateDeckCountUI()
     {
-        if (playerDeckCountText != null) playerDeckCountText.text = playerDeck.Count.ToString();
-        if (aiDeckCountText != null) aiDeckCountText.text = aiDeck.Count.ToString();
+        if (playerDeckCountText != null) playerDeckCountText.text = LocalDeckCount.ToString();
+        if (aiDeckCountText != null) aiDeckCountText.text = OpponentDeckCount.ToString();
     }
 
     public void SetStatus(string msg)

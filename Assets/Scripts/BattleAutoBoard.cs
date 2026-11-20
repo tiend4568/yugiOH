@@ -36,9 +36,11 @@ public class BattleAutoBoard : MonoBehaviour
     private Button directAttackButton;
     private Button cancelSelectButton;
 
-    // Thông tin Mộ bài
+    // Thông tin Mộ bài & Bộ bài/Tay bài
     private TextMeshProUGUI playerGyText;
     private TextMeshProUGUI aiGyText;
+    private TextMeshProUGUI playerDeckHandInfoText;
+    private TextMeshProUGUI aiDeckHandInfoText;
 
     // Popup chọn bài từ Mộ (Hồi sinh / Hiệu ứng FLIP / Xem Mộ)
     private GameObject graveyardModal;
@@ -47,6 +49,13 @@ public class BattleAutoBoard : MonoBehaviour
     private Button graveyardCloseButton;
     private Action<int> onGraveyardCardPicked;
     private Func<CardData, bool> graveyardCardFilter;
+
+    // Menu chọn lá bài đang úp (Phép/Bẫy) để kích hoạt ngay khi bị tấn công
+    private GameObject defenseReactionModal;
+    private TextMeshProUGUI defenseReactionTitle;
+    private RectTransform defenseReactionGridContent;
+    private Button defenseReactionSkipButton;
+    private Action<int> onDefenseReactionZonePicked;
 
     // Trạng thái tương tác của người chơi
     private int selectedAttackerZone = -1;
@@ -91,9 +100,7 @@ public class BattleAutoBoard : MonoBehaviour
         if (isInitialized) return;
         isInitialized = true;
 
-        cardBackSprite = Resources.Load<Sprite>("Cards/CardBack");
-        if (cardBackSprite == null) cardBackSprite = Resources.Load<Sprite>("CardBack");
-        if (cardBackSprite == null) cardBackSprite = CreateProceduralCardBack();
+        cardBackSprite = LoadCardBackSprite();
 
         BattleManager bm = BattleManager.Instance;
         boardCanvas = bm != null ? bm.GetBattleCanvas() : FindObjectOfType<Canvas>();
@@ -122,6 +129,7 @@ public class BattleAutoBoard : MonoBehaviour
         BuildFieldActionBar();
         BuildGraveyardHUD();
         BuildGraveyardModal();
+        BuildDefenseReactionModal();
     }
 
     void Update()
@@ -406,12 +414,44 @@ public class BattleAutoBoard : MonoBehaviour
         });
         playerGyText = pGyBtn.GetComponentInChildren<TextMeshProUGUI>();
 
+        playerDeckHandInfoText = CreateBoxedLabel(
+            boardRoot,
+            "PlayerDeckHandInfo",
+            anchorMin: new Vector2(0.5f, 0.5f),
+            anchorMax: new Vector2(0.5f, 0.5f),
+            pivot: new Vector2(0.5f, 0.5f),
+            anchoredPos: new Vector2(455f, -138f),
+            size: new Vector2(135f, 30f),
+            fontSize: 12f,
+            style: FontStyles.Bold,
+            textColor: Color.white,
+            align: TextAlignmentOptions.Center,
+            boxColor: new Color(0f, 0f, 0f, 0.72f),
+            out _
+        );
+
         Button aGyBtn = CreateActionButton(boardRoot, "MỘ AI (0)", new Vector2(455f, 248f), new Vector2(135f, 50f), new Color(0.32f, 0.18f, 0.22f, 0.92f), () =>
         {
             BattleManager bm = BattleManager.Instance;
             if (bm != null) OpenGraveyardViewOnly("MỘ BÀI ĐỐI PHƯƠNG", bm.aiGraveyard);
         });
         aiGyText = aGyBtn.GetComponentInChildren<TextMeshProUGUI>();
+
+        aiDeckHandInfoText = CreateBoxedLabel(
+            boardRoot,
+            "AIDeckHandInfo",
+            anchorMin: new Vector2(0.5f, 0.5f),
+            anchorMax: new Vector2(0.5f, 0.5f),
+            pivot: new Vector2(0.5f, 0.5f),
+            anchoredPos: new Vector2(455f, 202f),
+            size: new Vector2(135f, 30f),
+            fontSize: 12f,
+            style: FontStyles.Bold,
+            textColor: Color.white,
+            align: TextAlignmentOptions.Center,
+            boxColor: new Color(0f, 0f, 0f, 0.72f),
+            out _
+        );
     }
 
     void BuildGraveyardModal()
@@ -461,6 +501,64 @@ public class BattleAutoBoard : MonoBehaviour
         graveyardModal.SetActive(false);
     }
 
+    void BuildDefenseReactionModal()
+    {
+        defenseReactionModal = new GameObject("DefenseReactionModal", typeof(RectTransform), typeof(Image));
+        defenseReactionModal.transform.SetParent(boardCanvas.transform, false);
+        RectTransform mRT = defenseReactionModal.GetComponent<RectTransform>();
+        mRT.anchorMin = new Vector2(0.5f, 0.5f);
+        mRT.anchorMax = new Vector2(0.5f, 0.5f);
+        mRT.sizeDelta = new Vector2(820f, 380f);
+        defenseReactionModal.GetComponent<Image>().color = new Color(0.11f, 0.05f, 0.16f, 0.96f);
+
+        defenseReactionTitle = CreateBoxedLabel(
+            defenseReactionModal.transform,
+            "Title",
+            new Vector2(0.5f, 1f),
+            new Vector2(0.5f, 1f),
+            new Vector2(0.5f, 1f),
+            new Vector2(0f, -14f),
+            new Vector2(770f, 54f),
+            18f,
+            FontStyles.Bold,
+            Color.white,
+            TextAlignmentOptions.Center,
+            new Color(0f, 0f, 0f, 0.78f),
+            out _
+        );
+        defenseReactionTitle.enableWordWrapping = true;
+
+        GameObject gridObj = new GameObject("SetCardsGrid", typeof(RectTransform), typeof(GridLayoutGroup));
+        gridObj.transform.SetParent(defenseReactionModal.transform, false);
+        defenseReactionGridContent = gridObj.GetComponent<RectTransform>();
+        defenseReactionGridContent.anchorMin = new Vector2(0.5f, 0.5f);
+        defenseReactionGridContent.anchorMax = new Vector2(0.5f, 0.5f);
+        defenseReactionGridContent.anchoredPosition = new Vector2(0f, -6f);
+        defenseReactionGridContent.sizeDelta = new Vector2(760f, 210f);
+
+        GridLayoutGroup grid = gridObj.GetComponent<GridLayoutGroup>();
+        grid.cellSize = new Vector2(132f, 186f);
+        grid.spacing = new Vector2(16f, 12f);
+        grid.childAlignment = TextAnchor.MiddleCenter;
+
+        defenseReactionSkipButton = CreateActionButton(
+            defenseReactionModal.transform,
+            "KHÔNG KÍCH HOẠT (BỎ QUA)",
+            new Vector2(0f, -152f),
+            new Vector2(280f, 44f),
+            new Color(0.35f, 0.35f, 0.42f, 1f),
+            () =>
+            {
+                Action<int> cb = onDefenseReactionZonePicked;
+                onDefenseReactionZonePicked = null;
+                defenseReactionModal.SetActive(false);
+                cb?.Invoke(-1);
+            }
+        );
+
+        defenseReactionModal.SetActive(false);
+    }
+
     // ==================== CÁC HÀM CÔNG KHAI CHO BattleCardDragUI ====================
 
     public void ShowCardPreview(CardData data)
@@ -489,7 +587,15 @@ public class BattleAutoBoard : MonoBehaviour
     public void RequestSummonFromHand(int handIndex, BattlePosition pos, int preferredZone = -1)
     {
         BattleManager bm = BattleManager.Instance;
-        if (bm == null || bm.duel == null || bm.duel.Current != bm.humanPlayer) return;
+        if (bm == null || bm.duel == null) return;
+        if (bm.duel.Current != bm.humanPlayer)
+        {
+            if (bm.IsMultiplayer)
+            {
+                bm.SetStatus($"Chưa tới lượt của bạn! Đang là lượt của {bm.OpponentDisplayName}.");
+            }
+            return;
+        }
         if (bm.currentState != BattleManager.TurnState.MainPhase) return;
         if (handIndex < 0 || handIndex >= bm.playerHand.Count) return;
 
@@ -526,6 +632,117 @@ public class BattleAutoBoard : MonoBehaviour
         PopulateGraveyardGrid(graveyard, selectable: true);
         graveyardModal.transform.SetAsLastSibling();
         graveyardModal.SetActive(true);
+    }
+
+    public void CloseGraveyardModalIfOpen()
+    {
+        if (graveyardModal != null && graveyardModal.activeSelf)
+        {
+            onGraveyardCardPicked = null;
+            graveyardCardFilter = null;
+            graveyardModal.SetActive(false);
+        }
+    }
+
+    public void OpenDefenseReactionModal(string customTitle, Action<int> onZonePickedOrSkipped)
+    {
+        if (defenseReactionModal == null) return;
+        BattleManager bm = BattleManager.Instance;
+        if (bm == null) return;
+
+        onDefenseReactionZonePicked = onZonePickedOrSkipped;
+        defenseReactionTitle.text = string.IsNullOrEmpty(customTitle)
+            ? "ĐỐI THỦ TẤN CÔNG! CHỌN 1 LÁ BÀI PHÉP / BẪY ĐANG ÚP ĐỂ KÍCH HOẠT HOẶC BỎ QUA"
+            : customTitle;
+
+        for (int i = defenseReactionGridContent.childCount - 1; i >= 0; i--)
+        {
+            Destroy(defenseReactionGridContent.GetChild(i).gameObject);
+        }
+
+        for (int i = 0; i < Player.ZoneCount; i++)
+        {
+            CardData sp = bm.playerSpellZones[i];
+            if (sp == null || !bm.playerSpellFaceDown[i]) continue;
+
+            int zoneIdx = i;
+            bool canActivate = bm.CanPlayerSetCardReact(zoneIdx, out string failReason);
+
+            GameObject item = new GameObject($"SetCard_{zoneIdx}_{sp.cardName}", typeof(RectTransform), typeof(Image), typeof(Button));
+            item.transform.SetParent(defenseReactionGridContent, false);
+
+            Image img = item.GetComponent<Image>();
+            img.sprite = sp.cardSprite != null ? sp.cardSprite : cardBackSprite;
+            img.preserveAspect = true;
+            img.color = canActivate ? Color.white : new Color(0.45f, 0.45f, 0.52f, 0.85f);
+
+            TextMeshProUGUI topBadge = CreateBoxedLabel(
+                item.transform,
+                "TopBadge",
+                anchorMin: new Vector2(0.5f, 1f),
+                anchorMax: new Vector2(0.5f, 1f),
+                pivot: new Vector2(0.5f, 1f),
+                anchoredPos: new Vector2(0f, -2f),
+                size: new Vector2(128f, 22f),
+                fontSize: 11f,
+                style: FontStyles.Bold,
+                textColor: Color.white,
+                align: TextAlignmentOptions.Center,
+                boxColor: canActivate
+                    ? new Color(0.14f, 0.62f, 0.32f, 0.92f)
+                    : new Color(0.45f, 0.25f, 0.15f, 0.88f),
+                out _
+            );
+            topBadge.text = canActivate ? $"Ô #{zoneIdx + 1} [KÍCH HOẠT]" : $"Ô #{zoneIdx + 1} [CHƯA ĐỦ ĐK]";
+
+            TextMeshProUGUI bottomBadge = CreateBoxedLabel(
+                item.transform,
+                "BottomBadge",
+                anchorMin: new Vector2(0.5f, 0f),
+                anchorMax: new Vector2(0.5f, 0f),
+                pivot: new Vector2(0.5f, 0f),
+                anchoredPos: new Vector2(0f, 2f),
+                size: new Vector2(128f, 36f),
+                fontSize: 11f,
+                style: FontStyles.Bold,
+                textColor: Color.white,
+                align: TextAlignmentOptions.Center,
+                boxColor: new Color(0f, 0f, 0f, 0.82f),
+                out _
+            );
+            bottomBadge.enableWordWrapping = true;
+            bottomBadge.text = $"{sp.cardName}\n[{sp.CardTag}]";
+
+            AddHoverTrigger(item, () => ShowInspectorCard(sp, null));
+
+            Button btn = item.GetComponent<Button>();
+            btn.onClick.AddListener(() =>
+            {
+                ShowInspectorCard(sp, null);
+                if (!canActivate)
+                {
+                    bm.SetStatus($"[{sp.cardName}] chưa thể kích hoạt: {failReason}");
+                    return;
+                }
+
+                Action<int> cb = onDefenseReactionZonePicked;
+                onDefenseReactionZonePicked = null;
+                defenseReactionModal.SetActive(false);
+                cb?.Invoke(zoneIdx);
+            });
+        }
+
+        defenseReactionModal.transform.SetAsLastSibling();
+        defenseReactionModal.SetActive(true);
+    }
+
+    public void CloseDefenseReactionModalIfOpen()
+    {
+        if (defenseReactionModal != null && defenseReactionModal.activeSelf)
+        {
+            onDefenseReactionZonePicked = null;
+            defenseReactionModal.SetActive(false);
+        }
     }
 
     void OpenGraveyardViewOnly(string title, List<CardData> graveyard)
@@ -680,8 +897,16 @@ public class BattleAutoBoard : MonoBehaviour
             else
             {
                 slot.cardArtImage.enabled = true;
-                slot.cardArtImage.sprite = mc.data.cardSprite != null ? mc.data.cardSprite : cardBackSprite;
-                slot.cardArtImage.color = mc.IsFaceDown ? new Color(0.65f, 0.72f, 0.9f, 0.95f) : Color.white;
+                if (mc.IsFaceDown)
+                {
+                    slot.cardArtImage.sprite = cardBackSprite;
+                    slot.cardArtImage.color = Color.white;
+                }
+                else
+                {
+                    slot.cardArtImage.sprite = mc.data.cardSprite != null ? mc.data.cardSprite : cardBackSprite;
+                    slot.cardArtImage.color = Color.white;
+                }
                 slot.cardVisualRT.localEulerAngles = mc.IsDefense ? new Vector3(0f, 0f, 90f) : Vector3.zero;
 
                 string statStr = $"{mc.Atk}/{mc.Def}";
@@ -762,18 +987,24 @@ public class BattleAutoBoard : MonoBehaviour
             else
             {
                 slot.cardArtImage.enabled = true;
-                slot.cardArtImage.sprite = sp.cardSprite != null ? sp.cardSprite : cardBackSprite;
 
                 if (bm.playerSpellFaceDown[i])
                 {
-                    slot.cardArtImage.color = new Color(0.65f, 0.78f, 0.9f, 0.95f);
+                    slot.cardArtImage.sprite = cardBackSprite;
+                    slot.cardArtImage.color = Color.white;
                     SetSlotBadges(slot, "[ÚP - BẤM DÙNG]", sp.cardName);
                     slot.frameImage.color = new Color(0.18f, 0.62f, 0.48f, 0.78f);
                 }
                 else
                 {
+                    slot.cardArtImage.sprite = sp.cardSprite != null ? sp.cardSprite : cardBackSprite;
                     slot.cardArtImage.color = Color.white;
-                    SetSlotBadges(slot, "[KÍCH HOẠT]", sp.cardName);
+                    string topState = "[KÍCH HOẠT]";
+                    if (sp.spellEffect == SpellEffectType.SwordsOfRevealingLight && bm.aiPlayer != null && bm.aiPlayer.swordsBlockTurnsRemaining > 0)
+                    {
+                        topState = $"[KHÓA {bm.aiPlayer.swordsBlockTurnsRemaining} LƯỢT]";
+                    }
+                    SetSlotBadges(slot, topState, sp.cardName);
                     slot.frameImage.color = new Color(0.2f, 0.85f, 0.65f, 0.9f);
                 }
             }
@@ -797,12 +1028,19 @@ public class BattleAutoBoard : MonoBehaviour
                 if (bm.aiSpellFaceDown[i])
                 {
                     slot.cardArtImage.sprite = cardBackSprite;
+                    slot.cardArtImage.color = Color.white;
                     SetSlotBadges(slot, "[ÚP]", "");
                 }
                 else
                 {
                     slot.cardArtImage.sprite = sp.cardSprite != null ? sp.cardSprite : cardBackSprite;
-                    SetSlotBadges(slot, "[KÍCH HOẠT]", sp.cardName);
+                    slot.cardArtImage.color = Color.white;
+                    string topState = "[KÍCH HOẠT]";
+                    if (sp.spellEffect == SpellEffectType.SwordsOfRevealingLight && bm.humanPlayer != null && bm.humanPlayer.swordsBlockTurnsRemaining > 0)
+                    {
+                        topState = $"[KHÓA {bm.humanPlayer.swordsBlockTurnsRemaining} LƯỢT]";
+                    }
+                    SetSlotBadges(slot, topState, sp.cardName);
                     slot.frameImage.color = new Color(0.2f, 0.85f, 0.65f, 0.9f);
                 }
             }
@@ -910,7 +1148,16 @@ public class BattleAutoBoard : MonoBehaviour
     void RefreshGraveyardCounters(BattleManager bm)
     {
         if (playerGyText != null) playerGyText.text = $"MỘ BÀI ({bm.playerGraveyard.Count})";
-        if (aiGyText != null) aiGyText.text = $"MỘ AI ({bm.aiGraveyard.Count})";
+        if (aiGyText != null) aiGyText.text = bm.IsMultiplayer ? $"MỘ ĐỐI THỦ ({bm.aiGraveyard.Count})" : $"MỘ AI ({bm.aiGraveyard.Count})";
+
+        if (playerDeckHandInfoText != null)
+        {
+            playerDeckHandInfoText.text = $"DECK: {bm.LocalDeckCount} | TAY: {bm.playerHand.Count}";
+        }
+        if (aiDeckHandInfoText != null)
+        {
+            aiDeckHandInfoText.text = $"DECK: {bm.OpponentDeckCount} | TAY: {bm.OpponentHandCount}";
+        }
     }
 
     void BeginSummonFlow(int handIndex, BattlePosition pos, int preferredZone = -1)
@@ -1009,7 +1256,7 @@ public class BattleAutoBoard : MonoBehaviour
     void OnClickPlayerSpellZone(int spellZoneIndex)
     {
         BattleManager bm = BattleManager.Instance;
-        if (bm == null || bm.duel.Current != bm.humanPlayer) return;
+        if (bm == null || bm.duel == null) return;
 
         CardData sp = bm.playerSpellZones[spellZoneIndex];
         if (sp == null) return;
@@ -1204,6 +1451,32 @@ public class BattleAutoBoard : MonoBehaviour
             }
         });
         trigger.triggers.Add(entry);
+    }
+
+    Sprite LoadCardBackSprite()
+    {
+        string[] candidatePaths =
+        {
+            "Cards/Card_Back",
+            "Cards/card_back",
+            "Cards/CardBack",
+            "Card_Back",
+            "CardBack"
+        };
+
+        foreach (string path in candidatePaths)
+        {
+            Sprite sp = Resources.Load<Sprite>(path);
+            if (sp != null) return sp;
+
+            Texture2D tex = Resources.Load<Texture2D>(path);
+            if (tex != null)
+            {
+                return Sprite.Create(tex, new Rect(0f, 0f, tex.width, tex.height), new Vector2(0.5f, 0.5f));
+            }
+        }
+
+        return CreateProceduralCardBack();
     }
 
     Sprite CreateProceduralCardBack()
