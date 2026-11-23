@@ -70,7 +70,7 @@ public class CardItem : MonoBehaviour, IPointerClickHandler, IPointerEnterHandle
         {
             statText.color = Color.white;
             if (data.cardType == CardType.Monster)
-                statText.text = $"LV{data.level} {data.atk}/{data.def}";
+                statText.text = $"LV{data.level} {data.StatDisplay}";
             else if (data.cardType == CardType.Trap)
                 statText.text = "BẪY";
             else

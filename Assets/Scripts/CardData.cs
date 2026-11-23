@@ -14,21 +14,22 @@ public enum SpellEffectType
 {
     None,
     DestroyAllEnemyMonsters,    // Raigeki: Tiêu diệt toàn bộ quái đối thủ
-    DestroyAllMonsters,         // Dark Hole: Tiêu diệt toàn bộ quái trên sân
-    DrawCards,                  // Pot of Greed: Rút thêm 2 lá bài
+    DestroyAllMonsters,         // Dark Hole (Hố Đen): Phá hủy tất cả quái thú trên sân
+    DrawCards,                  // Pot of Greed (Hũ Tham Lam): Rút 2 lá bài
     HealLP,                     // Hồi LP bản thân
     DamageEnemyLP,              // Trừ thẳng LP đối thủ
     BuffAllMyMonstersATK,       // Tăng ATK toàn bộ quái phe mình
     DebuffAllEnemyMonstersATK,  // Giảm ATK toàn bộ quái đối thủ
     ReviveFromGraveyard,        // Monster Reborn: Hồi sinh 1 quái thú từ Mộ
     SwordsOfRevealingLight,     // Lớp Kiếm Bảo Hộ Của Ánh Sáng: Lật ngửa quái địch, chặn tấn công 3 lượt đối thủ
-    MagicalHats                 // Mũ Tơ Ma Thuật (Trap): Giấu 1 quái cùng 2 Phép/Bẫy từ Deck thành quái úp 0/0 và xáo vị trí
+    MagicalHats,                // Mũ Tơ Ma Thuật (Trap): Giấu 1 quái cùng 2 Phép/Bẫy từ Deck thành quái úp 0/0 và xáo vị trí
+    TrapHole                    // Hang Rơi (Trap): Khi đối thủ Triệu hồi Thường / Lật quái có ATK >= 1000, phá hủy quái đó
 }
 
 public enum MonsterEffectType
 {
     None,                           // Quái thường (NORMAL)
-    FlipReturnGraveyardToDeck,      // FLIP: Chọn 1 lá trong Mộ xáo trộn vào Deck
+    FlipReturnGraveyardToDeck,      // FLIP (Gremlin Tử Thần): Chọn 1 lá trong Mộ xáo trộn vào Deck
     FlipDestroyEnemyMonster,        // FLIP: Tiêu diệt 1 quái mạnh nhất của đối thủ
     FlipReturnEnemyMonsterToHand,   // FLIP: Đẩy 1 quái trên sân đối phương về lại tay
     OnSummonDestroyEnemyMonster,    // Khi Triệu Hồi: Tiêu diệt 1 quái mạnh nhất của đối thủ
@@ -38,7 +39,11 @@ public enum MonsterEffectType
     OnDestroyedSearchMonster,       // Khi Bị Tiêu Diệt Xuống Mộ: Tìm 1 quái ATK <= 1500 lên tay
     PiercingDamage,                 // Xuyên Thủ: Tấn công quái phòng thủ vẫn trừ LP chênh lệch
     BattleIndestructible,           // Bất Tử Chiến Đấu: Không bị phá hủy bởi chiến đấu
-    BoostATKOnAttack                // Cuồng Nộ: Tăng vĩnh viễn +300 ATK mỗi lần tấn công
+    BoostATKOnAttack,               // Cuồng Nộ: Tăng vĩnh viễn +300 ATK mỗi lần tấn công
+    KuribohHandGuard,               // Kuriboh: Khi bị tấn công, bỏ lá này từ trên tay xuống Mộ để nhận 0 sát thương chiến đấu
+    DivineObelisk,                  // Thần Lính Khổng Lồ Obelisk: 3 hiến tế, không thể bị chọn làm mục tiêu, hiến tế 2 quái diệt sạch quái đối thủ, tự xuống Mộ ở End Phase nếu Triệu hồi Đặc biệt
+    DivineSlifer,                   // Rồng Thần Bầu Trời Slifer: 3 hiến tế, +1000 ATK/DEF mỗi lá trên tay, quái đối thủ triệu hồi thế Công mất 2000 ATK (về 0 thì nổ), tự xuống Mộ ở End Phase nếu Triệu hồi Đặc biệt
+    DivineRa                        // Rồng Cánh Thần Của Ra: 3 hiến tế, không thể Triệu hồi Đặc biệt, trả LP còn 100 khi Triệu hồi Thường để cộng ATK/DEF, trả 1000 LP phá hủy 1 quái
 }
 
 [Serializable]
@@ -60,12 +65,26 @@ public class CardData
 
     public bool IsSpellOrTrap => cardType == CardType.Spell || cardType == CardType.Trap;
 
+    public bool IsDivineGod =>
+        monsterEffect == MonsterEffectType.DivineObelisk ||
+        monsterEffect == MonsterEffectType.DivineSlifer ||
+        monsterEffect == MonsterEffectType.DivineRa;
+
+    public bool CannotBeSpecialSummoned => monsterEffect == MonsterEffectType.DivineRa;
+    public bool CannotBeTargetedByEffects => monsterEffect == MonsterEffectType.DivineObelisk;
+    public bool HasQuestionMarkStats =>
+        monsterEffect == MonsterEffectType.DivineSlifer ||
+        monsterEffect == MonsterEffectType.DivineRa;
+
+    public string StatDisplay => HasQuestionMarkStats ? "?/?" : $"{atk}/{def}";
+
     public string CardTag
     {
         get
         {
             if (cardType == CardType.Spell) return "BÀI PHÉP";
             if (cardType == CardType.Trap) return "BÀI BẪY";
+            if (IsDivineGod) return "THẦN AI CẬP";
             return monsterEffect != MonsterEffectType.None ? "QUÁI HIỆU ỨNG" : "QUÁI THÚ";
         }
     }
@@ -164,18 +183,42 @@ public class CardDatabaseSO : ScriptableObject
             if (treatAsSpellOrTrap)
             {
                 CardType finalType = explicitCardType ?? (found.cardType == CardType.Trap ? CardType.Trap : CardType.Spell);
+                SpellEffectType finalSpellEffect = found.spellEffect;
+                int finalSpellVal = found.effectValue;
+                string finalSpellDesc = found.description;
+
+                if (finalSpellEffect == SpellEffectType.None)
+                {
+                    CardData autoSp = AutoBuildFallbackSpell(rawFileName, sprite);
+                    finalSpellEffect = autoSp.spellEffect;
+                    finalSpellVal = autoSp.effectValue;
+                    if (!string.IsNullOrEmpty(autoSp.description)) finalSpellDesc = autoSp.description;
+                }
+
                 return finalType == CardType.Trap
-                    ? CardData.CreateTrap(cleanName, sprite, found.spellEffect, found.effectValue, found.description)
-                    : CardData.CreateSpell(cleanName, sprite, found.spellEffect, found.effectValue, found.description);
+                    ? CardData.CreateTrap(cleanName, sprite, finalSpellEffect, finalSpellVal, finalSpellDesc)
+                    : CardData.CreateSpell(cleanName, sprite, finalSpellEffect, finalSpellVal, finalSpellDesc);
             }
 
             int finalLevel = explicitLevel ?? Mathf.Clamp(found.level, 1, 12);
+            MonsterEffectType finalMonsterEff = found.monsterEffect;
+            int finalMonsterVal = found.effectValue;
+            string finalMonsterDesc = found.description;
 
-            return new CardData(cleanName, sprite, found.atk, found.def, finalLevel, found.description)
+            if (finalMonsterEff == MonsterEffectType.None &&
+                TryGetMonsterByName(cleanName, out _, out _, out _, out MonsterEffectType presetEff, out int presetVal, out string presetDesc) &&
+                presetEff != MonsterEffectType.None)
+            {
+                finalMonsterEff = presetEff;
+                finalMonsterVal = presetVal;
+                if (!string.IsNullOrEmpty(presetDesc)) finalMonsterDesc = presetDesc;
+            }
+
+            return new CardData(cleanName, sprite, found.atk, found.def, finalLevel, finalMonsterDesc)
             {
                 cardType = CardType.Monster,
-                monsterEffect = found.monsterEffect,
-                effectValue = found.effectValue
+                monsterEffect = finalMonsterEff,
+                effectValue = finalMonsterVal
             };
         }
 
@@ -301,7 +344,40 @@ public class CardDatabaseSO : ScriptableObject
         if (key.Contains("feral imp") || key.Contains("gremlin tử thần"))
         {
             lv = 4; atk = 1600; def = 1800;
-            desc = "Một tiểu yêu tinh tinh nghịch ẩn nấp trong bóng tối.";
+            eff = MonsterEffectType.FlipReturnGraveyardToDeck;
+            desc = "FLIP: Chọn vào 1 lá bài trong Mộ của bạn; xáo trộn mục tiêu đó vào Deck.";
+            return true;
+        }
+
+        if (key.Contains("kuriboh"))
+        {
+            lv = 1; atk = 300; def = 200;
+            eff = MonsterEffectType.KuribohHandGuard;
+            desc = "Trong damage calculation, nếu quái thú của đối thủ tấn công (Hiệu ứng nhanh): Bạn có thể gửi xuống Mộ lá bài này từ trên tay; bạn không nhận bất cứ thiệt hại nào từ chiến đấu đó.";
+            return true;
+        }
+
+        if (key.Contains("obelisk") || key.Contains("thần lính khổng lồ"))
+        {
+            lv = 10; atk = 4000; def = 4000;
+            eff = MonsterEffectType.DivineObelisk;
+            desc = "Yêu cầu 3 hiến tế để Triệu hồi Thường (không thể Triệu hồi Úp Thường). Khi được Triệu hồi Thường, các lá bài và hiệu ứng không thể được kích hoạt. Cả hai người chơi không thể chọn lá bài này làm mục tiêu với các hiệu ứng của lá bài. Một lần mỗi lượt, trong End Phase, nếu lá bài này được Triệu hồi Đặc biệt: Gửi nó đến Mộ. Bạn có thể Hiến tế 2 quái thú; phá huỷ tất cả quái thú mà đối thủ của bạn điều khiển (không thể tuyên bố tấn công khi hiệu ứng này được kích hoạt).";
+            return true;
+        }
+
+        if (key.Contains("slifer") || key.Contains("rồng thần bầu trời"))
+        {
+            lv = 10; atk = 0; def = 0;
+            eff = MonsterEffectType.DivineSlifer;
+            desc = "Yêu cầu 3 hiến tế để Triệu hồi Thường (không thể Triệu hồi Úp Thường). Khi được Triệu hồi Thường, các lá bài và hiệu ứng không thể được kích hoạt. Một lần mỗi lượt, trong End Phase, nếu lá bài này được Triệu hồi Đặc biệt: Gửi nó đến Mộ. Nhận 1000 ATK / DEF cho mỗi lá bài trong tay của bạn. Nếu quái thú được Triệu hồi Thường hoặc Đặc biệt đến sân của đối thủ ở Tư thế Tấn công: Quái thú đó mất 2000 ATK, nếu ATK của nó bị giảm xuống 0 do đó, hãy phá huỷ nó.";
+            return true;
+        }
+
+        if (key.Contains("winged dragon of ra") || key.Contains("rồng cánh thần của ra"))
+        {
+            lv = 10; atk = 0; def = 0;
+            eff = MonsterEffectType.DivineRa;
+            desc = "Không thể được Triệu hồi Đặc biệt. Yêu cầu 3 hiến tế để Triệu hồi Thường (không thể Triệu hồi Úp Thường). Khi được Triệu hồi Thường, các lá bài và hiệu ứng khác không thể được kích hoạt. Khi lá bài này được Triệu hồi Thường: Bạn có thể trả LP để bạn chỉ còn lại 100; lá bài này nhận được ATK / DEF bằng với số LP được trả. Bạn có thể trả 1000 LP, sau đó chọn vào 1 quái thú trên sân; phá huỷ mục tiêu đó.";
             return true;
         }
 
@@ -396,9 +472,9 @@ public class CardDatabaseSO : ScriptableObject
             );
         }
 
-        if (key.Contains("pot of greed") || key.Contains("chiếc bình tham lam"))
+        if (key.Contains("pot of greed") || key.Contains("hũ tham lam") || key.Contains("chiếc bình tham lam"))
         {
-            return CardData.CreateSpell(cleanName, sprite, SpellEffectType.DrawCards, 2, "Rút 2 lá bài từ Bộ bài.");
+            return CardData.CreateSpell(cleanName, sprite, SpellEffectType.DrawCards, 2, "Rút 2 lá bài.");
         }
 
         if (key.Contains("raigeki") || key.Contains("sét đánh"))
@@ -408,7 +484,18 @@ public class CardDatabaseSO : ScriptableObject
 
         if (key.Contains("dark hole") || key.Contains("hố đen"))
         {
-            return CardData.CreateSpell(cleanName, sprite, SpellEffectType.DestroyAllMonsters, 0, "Tiêu diệt toàn bộ quái thú trên sân.");
+            return CardData.CreateSpell(cleanName, sprite, SpellEffectType.DestroyAllMonsters, 0, "Phá hủy tất cả những quái thú trên sân.");
+        }
+
+        if (key.Contains("trap hole") || key.Contains("hang rơi"))
+        {
+            return CardData.CreateTrap(
+                cleanName,
+                sprite,
+                SpellEffectType.TrapHole,
+                1000,
+                "Khi đối thủ của bạn Thường hoặc Lật Hiến tế 1 quái thú có 1000 ATK hoặc lớn hơn: Chọn vào quái thú đó; phá huỷ mục tiêu đó."
+            );
         }
 
         if (taggedType == CardType.Trap)
