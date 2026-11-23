@@ -17,6 +17,7 @@ public class MonsterCard
     public BattlePosition position;
 
     public bool summonedThisTurn;
+    public bool isSpecialSummoned;
     public bool hasAttacked;
     public bool positionChanged;
     public bool faceUpEffectTriggered;
@@ -28,10 +29,34 @@ public class MonsterCard
     public bool isMagicalHatDecoy;
     public CardData originalSpellTrapData;
 
-    public int Atk => isMagicalHatDecoy ? 0 : Math.Max(0, data.atk + atkModifier);
-    public int Def => isMagicalHatDecoy ? 0 : Math.Max(0, data.def + defModifier);
+    public int Atk
+    {
+        get
+        {
+            if (isMagicalHatDecoy) return 0;
+            int baseAtk = (data != null && data.monsterEffect == MonsterEffectType.DivineSlifer && owner != null)
+                ? owner.handCount * 1000
+                : (data != null ? data.atk : 0);
+            return Math.Max(0, baseAtk + atkModifier);
+        }
+    }
+
+    public int Def
+    {
+        get
+        {
+            if (isMagicalHatDecoy) return 0;
+            int baseDef = (data != null && data.monsterEffect == MonsterEffectType.DivineSlifer && owner != null)
+                ? owner.handCount * 1000
+                : (data != null ? data.def : 0);
+            return Math.Max(0, baseDef + defModifier);
+        }
+    }
+
     public bool IsFaceDown => position == BattlePosition.FaceDownDefense;
     public bool IsDefense => position != BattlePosition.FaceUpAttack;
+    public bool CannotBeTargetedByEffects =>
+        !isMagicalHatDecoy && !IsFaceDown && data != null && data.CannotBeTargetedByEffects;
 
     public bool CanAttack =>
         position == BattlePosition.FaceUpAttack && !hasAttacked;
@@ -52,8 +77,10 @@ public class Player
     public const int ZoneCount = 5;
 
     public string name;
-    public int lifePoints = 4000;
+    public int lifePoints = 8000;
+    public int handCount = 0;
     public bool normalSummonUsed;
+    public bool kuribohShieldActive;
     public MonsterCard[] monsterZones = new MonsterCard[ZoneCount];
 
     // Số lượt End Phase còn lại bị chặn tấn công bởi Lớp Kiếm Bảo Hộ Của Ánh Sáng
@@ -96,6 +123,9 @@ public class Duel
     public Action<Player, CardData> OnSendCardToGraveyard;
     public Action<Player> OnSwordsExpired;
 
+    // Sự kiện hình ảnh (VFX) khi quái thú hoặc Mũ Tơ Ma Thuật trên sân bị phá hủy
+    public event Action<MonsterCard> OnMonsterShattered;
+
     public Duel(Player p1, Player p2)
     {
         players = new[] { p1, p2 };
@@ -117,6 +147,21 @@ public class Duel
         if (IsGameOver) return;
 
         ResolveEndOfBattlePhase();
+
+        // Hiệu ứng End Phase của Obelisk và Slifer: Nếu được Triệu hồi Đặc biệt -> Gửi xuống Mộ
+        foreach (var pl in players)
+        {
+            foreach (var m in pl.Monsters.ToList())
+            {
+                if (m != null && !m.isMagicalHatDecoy && m.isSpecialSummoned &&
+                    (m.data.monsterEffect == MonsterEffectType.DivineObelisk ||
+                     m.data.monsterEffect == MonsterEffectType.DivineSlifer))
+                {
+                    Log($"End Phase: [{m.data.cardName}] được Triệu hồi Đặc biệt nên tự động trở về Mộ bài!");
+                    RemoveFromField(m, destroyedByBattle: true);
+                }
+            }
+        }
 
         // Đếm ngược Lớp Kiếm Bảo Hộ Của Ánh Sáng vào End Phase của người đang bị khóa
         if (Current.swordsBlockTurnsRemaining > 0)
@@ -144,6 +189,12 @@ public class Duel
         if (IsGameOver || data == null || data.cardType != CardType.Monster) return null;
         tributes = tributes ?? new List<MonsterCard>();
 
+        if (isSpecial && data.CannotBeSpecialSummoned)
+        {
+            Log($"[{data.cardName}] không thể được Triệu hồi Đặc biệt!");
+            return null;
+        }
+
         if (!isSpecial)
         {
             if (p != Current) { Log("Không phải lượt của bạn."); return null; }
@@ -151,7 +202,13 @@ public class Duel
             if (pos == BattlePosition.FaceUpDefense)
             { Log("Triệu hồi thường chỉ được ngửa-tấn-công hoặc úp-phòng-thủ (Set)."); return null; }
 
-            int need = RequiredTributes(data.level);
+            if (data.IsDivineGod && pos != BattlePosition.FaceUpAttack)
+            {
+                Log($"[{data.cardName}] chỉ được Triệu hồi Thường ở Tư thế Tấn công ngửa (không thể Triệu hồi Úp)!");
+                return null;
+            }
+
+            int need = RequiredTributes(data);
             if (tributes.Count != need) { Log($"Cần hiến tế {need} quái thú."); return null; }
             if (tributes.Any(t => t == null || t.owner != p)) { Log("Chỉ được hiến tế quái của mình."); return null; }
         }
@@ -173,20 +230,57 @@ public class Duel
             owner = p,
             zoneIndex = zone,
             position = pos,
-            summonedThisTurn = true
+            summonedThisTurn = true,
+            isSpecialSummoned = isSpecial
         };
         p.monsterZones[zone] = card;
         if (!isSpecial) p.normalSummonUsed = true;
 
-        Log($"{p.name} triệu hồi {(card.IsFaceDown ? "[Úp]" : $"{data.cardName} (ATK {data.atk}/DEF {data.def})")}");
+        Log($"{p.name} triệu hồi {(card.IsFaceDown ? "[Úp]" : $"{data.cardName} (ATK {card.Atk}/DEF {card.Def})")}");
         OnSummoned?.Invoke(card);
 
         if (!card.IsFaceDown)
         {
-            TriggerMonsterEffect(card, wasFlippedFromFaceDown: false);
+            ApplySliferThunderforceOnSummon(card);
+            if (p.monsterZones[zone] == card && !IsGameOver)
+            {
+                TriggerMonsterEffect(card, wasFlippedFromFaceDown: false);
+            }
         }
 
         return card;
+    }
+
+    public void ApplySliferThunderforceOnSummon(MonsterCard summonedCard)
+    {
+        if (summonedCard == null || summonedCard.IsFaceDown || summonedCard.isMagicalHatDecoy)
+            return;
+        if (summonedCard.position != BattlePosition.FaceUpAttack)
+            return;
+
+        Player summonedOwner = summonedCard.owner;
+        Player enemy = (summonedOwner == players[0]) ? players[1] : players[0];
+
+        var enemySlifers = enemy.Monsters
+            .Where(m => m != null && !m.IsFaceDown && !m.isMagicalHatDecoy && m.data.monsterEffect == MonsterEffectType.DivineSlifer)
+            .ToList();
+
+        if (enemySlifers.Count == 0) return;
+
+        foreach (var slifer in enemySlifers)
+        {
+            if (summonedOwner.monsterZones[summonedCard.zoneIndex] != summonedCard) break;
+
+            summonedCard.atkModifier -= 2000;
+            Log($"[Đạn Sấm Sét - {slifer.data.cardName}] Giảm 2000 ATK của [{summonedCard.data.cardName}] vừa triệu hồi (ATK còn {summonedCard.Atk})!");
+
+            if (summonedCard.Atk <= 0)
+            {
+                Log($"[Đạn Sấm Sét - {slifer.data.cardName}] ATK của [{summonedCard.data.cardName}] giảm về 0 -> Bị phá hủy ngay lập tức!");
+                RemoveFromField(summonedCard, destroyedByBattle: true);
+                break;
+            }
+        }
     }
 
     void TriggerMonsterEffect(MonsterCard card, bool wasFlippedFromFaceDown)
@@ -208,7 +302,10 @@ public class Duel
             case MonsterEffectType.FlipDestroyEnemyMonster:
                 if (!wasFlippedFromFaceDown) return;
                 card.faceUpEffectTriggered = true;
-                MonsterCard flipTarget = enemy.Monsters.OrderByDescending(m => m.Atk).FirstOrDefault();
+                MonsterCard flipTarget = enemy.Monsters
+                    .Where(m => !m.CannotBeTargetedByEffects)
+                    .OrderByDescending(m => m.Atk)
+                    .FirstOrDefault();
                 if (flipTarget != null)
                 {
                     Log($"[FLIP - {card.data.cardName}] Tiêu diệt {flipTarget.data.cardName}!");
@@ -219,7 +316,10 @@ public class Duel
             case MonsterEffectType.FlipReturnEnemyMonsterToHand:
                 if (!wasFlippedFromFaceDown) return;
                 card.faceUpEffectTriggered = true;
-                MonsterCard bounceTarget = enemy.Monsters.OrderByDescending(m => m.Atk).FirstOrDefault();
+                MonsterCard bounceTarget = enemy.Monsters
+                    .Where(m => !m.CannotBeTargetedByEffects)
+                    .OrderByDescending(m => m.Atk)
+                    .FirstOrDefault();
                 if (bounceTarget != null)
                 {
                     RemoveFromField(bounceTarget, destroyedByBattle: false);
@@ -237,7 +337,10 @@ public class Duel
 
             case MonsterEffectType.OnSummonDestroyEnemyMonster:
                 card.faceUpEffectTriggered = true;
-                MonsterCard summonTarget = enemy.Monsters.OrderByDescending(m => m.Atk).FirstOrDefault();
+                MonsterCard summonTarget = enemy.Monsters
+                    .Where(m => !m.CannotBeTargetedByEffects)
+                    .OrderByDescending(m => m.Atk)
+                    .FirstOrDefault();
                 if (summonTarget != null)
                 {
                     Log($"[Hiệu ứng {card.data.cardName}] Tiêu diệt {summonTarget.data.cardName}!");
@@ -371,9 +474,176 @@ public class Duel
                 }
                 return true;
 
+            case SpellEffectType.TrapHole:
+                failReason = "Hang Rơi chỉ kích hoạt khi đối thủ vừa Triệu hồi Thường / Lật quái thú có ATK >= 1000.";
+                return false;
+
             default:
                 return true;
         }
+    }
+
+    public static bool CanActivateTrapHoleOnSummon(CardData trapCard, MonsterCard summonedMonster, out string failReason)
+    {
+        failReason = "";
+        if (trapCard == null || trapCard.spellEffect != SpellEffectType.TrapHole)
+        {
+            failReason = "Không phải lá bài Hang Rơi.";
+            return false;
+        }
+        if (summonedMonster == null || summonedMonster.IsFaceDown || summonedMonster.isMagicalHatDecoy)
+        {
+            failReason = "Quái thú triệu hồi không nằm ngửa trên sân.";
+            return false;
+        }
+        if (summonedMonster.owner == null || summonedMonster.owner.monsterZones[summonedMonster.zoneIndex] != summonedMonster)
+        {
+            failReason = "Quái thú triệu hồi không còn trên sân.";
+            return false;
+        }
+        if (summonedMonster.data != null && summonedMonster.data.IsDivineGod)
+        {
+            failReason = $"Không thể kích hoạt bài/hiệu ứng khi [{summonedMonster.data.cardName}] được Triệu hồi Thường!";
+            return false;
+        }
+        if (summonedMonster.CannotBeTargetedByEffects)
+        {
+            failReason = $"[{summonedMonster.data.cardName}] không thể bị chọn làm mục tiêu của hiệu ứng!";
+            return false;
+        }
+        int minAtk = trapCard.effectValue > 0 ? trapCard.effectValue : 1000;
+        if (summonedMonster.Atk < minAtk)
+        {
+            failReason = $"ATK của [{summonedMonster.data.cardName}] ({summonedMonster.Atk}) thấp hơn {minAtk}.";
+            return false;
+        }
+        return true;
+    }
+
+    public bool ActivateTrapHoleOnSummon(Player trapOwner, CardData trapCard, MonsterCard summonedTarget)
+    {
+        if (IsGameOver || trapOwner == null || trapCard == null || summonedTarget == null) return false;
+        if (!CanActivateTrapHoleOnSummon(trapCard, summonedTarget, out string reason))
+        {
+            Log(reason);
+            return false;
+        }
+
+        OnSpellActivated?.Invoke(trapCard);
+        Log($"{trapOwner.name} kích hoạt Bài Bẫy [{trapCard.cardName}]: Phá hủy [{summonedTarget.data.cardName}] (ATK {summonedTarget.Atk}) vừa triệu hồi!");
+        RemoveFromField(summonedTarget, destroyedByBattle: true);
+        return true;
+    }
+
+    public bool ActivateObeliskSoulEnergyMax(Player p, MonsterCard obelisk, List<MonsterCard> tributes)
+    {
+        if (IsGameOver || p == null || obelisk == null) return false;
+        if (p != Current) { Log("Không phải lượt của bạn."); return false; }
+        if (obelisk.owner != p || obelisk.IsFaceDown || obelisk.data == null || obelisk.data.monsterEffect != MonsterEffectType.DivineObelisk)
+        {
+            Log("Không phải Thần Lính Khổng Lồ Obelisk đang nằm ngửa của bạn.");
+            return false;
+        }
+        if (obelisk.hasAttacked)
+        {
+            Log($"[{obelisk.data.cardName}] đã tấn công hoặc đã dùng hiệu ứng trong lượt này, không thể kích hoạt!");
+            return false;
+        }
+
+        Player enemy = (p == players[0]) ? players[1] : players[0];
+        if (enemy.MonsterCount == 0)
+        {
+            Log("Đối phương chưa có quái thú nào trên sân để phá hủy!");
+            return false;
+        }
+
+        if (tributes == null || tributes.Count != 2 || tributes.Distinct().Count() != 2 ||
+            tributes.Any(t => t == null || t.owner != p || p.monsterZones[t.zoneIndex] != t))
+        {
+            Log($"Cần chọn đúng 2 quái thú trên sân của bạn để hiến tế cho [{obelisk.data.cardName}]!");
+            return false;
+        }
+
+        foreach (var t in tributes)
+        {
+            bool wasDecoy = t.isMagicalHatDecoy;
+            CardData tData = t.data;
+            RemoveFromField(t, destroyedByBattle: false);
+            if (!wasDecoy && tData != null)
+            {
+                OnSendCardToGraveyard?.Invoke(p, tData);
+            }
+        }
+
+        foreach (var em in enemy.Monsters.ToList())
+        {
+            RemoveFromField(em, destroyedByBattle: true);
+        }
+
+        if (p.monsterZones[obelisk.zoneIndex] == obelisk)
+        {
+            obelisk.hasAttacked = true;
+            obelisk.faceUpEffectTriggered = true;
+        }
+
+        Log($"[{obelisk.data.cardName}] Hiến tế 2 quái thú -> Phá hủy toàn bộ quái thú của {enemy.name}! (Obelisk không thể tấn công lượt này)");
+        return true;
+    }
+
+    public bool ActivateRaPointToPointTransfer(Player p, MonsterCard ra)
+    {
+        if (IsGameOver || p == null || ra == null) return false;
+        if (ra.owner != p || ra.IsFaceDown || ra.data == null || ra.data.monsterEffect != MonsterEffectType.DivineRa)
+            return false;
+        if (p.lifePoints <= 100)
+        {
+            Log("LP hiện tại không đủ để trả xuống còn 100 LP!");
+            return false;
+        }
+
+        int paidLP = p.lifePoints - 100;
+        p.lifePoints = 100;
+        ra.atkModifier += paidLP;
+        ra.defModifier += paidLP;
+        ra.faceUpEffectTriggered = true;
+
+        Log($"[{ra.data.cardName}] {p.name} trả {paidLP} LP (chỉ còn 100 LP) -> Nhận +{paidLP} ATK / +{paidLP} DEF!");
+        OnDamage?.Invoke(p, paidLP);
+        return true;
+    }
+
+    public bool ActivateRaPhoenixDestroy(Player p, MonsterCard ra, MonsterCard target)
+    {
+        if (IsGameOver || p == null || ra == null || target == null) return false;
+        if (p != Current) { Log("Không phải lượt của bạn."); return false; }
+        if (ra.owner != p || ra.IsFaceDown || ra.data == null || ra.data.monsterEffect != MonsterEffectType.DivineRa)
+        {
+            Log("Không phải Rồng Cánh Thần Của Ra đang nằm ngửa của bạn.");
+            return false;
+        }
+        if (p.lifePoints <= 1000)
+        {
+            Log($"Cần có trên 1000 LP để kích hoạt hiệu ứng trả 1000 LP của [{ra.data.cardName}]!");
+            return false;
+        }
+        if (target.owner == null || target.owner.monsterZones[target.zoneIndex] != target)
+        {
+            Log("Mục tiêu không còn trên sân!");
+            return false;
+        }
+        if (target.CannotBeTargetedByEffects)
+        {
+            Log($"Không thể chọn [{target.data.cardName}] làm mục tiêu của hiệu ứng bài!");
+            return false;
+        }
+
+        p.lifePoints -= 1000;
+        OnDamage?.Invoke(p, 1000);
+
+        string targetName = target.IsFaceDown ? "quái thú úp" : target.data.cardName;
+        Log($"[{ra.data.cardName}] {p.name} trả 1000 LP (còn {p.lifePoints} LP) -> Phá hủy [{targetName}]!");
+        RemoveFromField(target, destroyedByBattle: true);
+        return true;
     }
 
     public bool ActivateSpell(Player p, CardData spell, MonsterCard protectedMonster = null, bool allowOutOfTurnReaction = false)
@@ -646,7 +916,7 @@ public class Duel
             if (diff > 0)
             {
                 TryDestroyInBattle(target);
-                DealDamage(Opponent, diff);
+                DealBattleDamageToDefender(Opponent, diff);
             }
             else if (diff < 0)
             {
@@ -669,7 +939,7 @@ public class Duel
                 if (attacker.data.monsterEffect == MonsterEffectType.PiercingDamage)
                 {
                     Log($"[Xuyên thủ] {attacker.data.cardName} gây {diff} sát thương xuyên qua phòng thủ!");
-                    DealDamage(Opponent, diff);
+                    DealBattleDamageToDefender(Opponent, diff);
                 }
             }
             else if (diff < 0)
@@ -683,7 +953,20 @@ public class Duel
             }
         }
 
+        Opponent.kuribohShieldActive = false;
         return true;
+    }
+
+    void DealBattleDamageToDefender(Player defender, int amount)
+    {
+        if (amount <= 0) return;
+        if (defender != null && defender.kuribohShieldActive)
+        {
+            defender.kuribohShieldActive = false;
+            Log($"[Kuriboh] Đã chặn hoàn toàn {amount} sát thương chiến đấu cho {defender.name} (0 sát thương)!");
+            return;
+        }
+        DealDamage(defender, amount);
     }
 
     void TryDestroyInBattle(MonsterCard card)
@@ -721,11 +1004,19 @@ public class Duel
             Log($"[Hiệu ứng {attacker.data.cardName}] Tăng +{boost} ATK!");
         }
 
-        DealDamage(Opponent, attacker.Atk);
+        DealBattleDamageToDefender(Opponent, attacker.Atk);
+        Opponent.kuribohShieldActive = false;
         return true;
     }
 
-    public static int RequiredTributes(int level) => level >= 7 ? 2 : level >= 5 ? 1 : 0;
+    public static int RequiredTributes(int level) => level >= 10 ? 3 : level >= 7 ? 2 : level >= 5 ? 1 : 0;
+
+    public static int RequiredTributes(CardData data)
+    {
+        if (data == null) return 0;
+        if (data.IsDivineGod) return 3;
+        return RequiredTributes(data.level);
+    }
 
     public void DealDamage(Player p, int amount)
     {
@@ -747,6 +1038,7 @@ public class Duel
                 if (m != null && m.isMagicalHatDecoy)
                 {
                     p.monsterZones[i] = null;
+                    OnMonsterShattered?.Invoke(m);
                     if (m.originalSpellTrapData != null)
                     {
                         OnSendCardToGraveyard?.Invoke(p, m.originalSpellTrapData);
@@ -774,6 +1066,7 @@ public class Duel
                     ? $"Mũ Tơ ({card.originalSpellTrapData.cardName})"
                     : "Mũ Tơ Ma Thuật";
                 Log($"{hatName} bị phá hủy!");
+                OnMonsterShattered?.Invoke(card);
             }
             if (card.originalSpellTrapData != null)
             {
@@ -785,6 +1078,7 @@ public class Duel
         if (destroyedByBattle)
         {
             Log($"{card.data.cardName} bị phá hủy!");
+            OnMonsterShattered?.Invoke(card);
             OnDestroyed?.Invoke(card);
 
             if (card.data.monsterEffect == MonsterEffectType.OnDestroyedSearchMonster)

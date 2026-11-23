@@ -1311,7 +1311,7 @@ public class MultiplayerLobbyManager : MonoBehaviour
 
                 if (inBattleScene)
                 {
-                    string msg = "Đối thủ đã ngắt kết nối khỏi trận đấu!";
+                    string msg = "Đối thủ đã thoát phòng — Bạn được xử thắng!";
                     SetStatus(msg);
                     OnMatchDisconnect?.Invoke(msg);
                 }
@@ -1328,12 +1328,12 @@ public class MultiplayerLobbyManager : MonoBehaviour
             string reason = networkManager.DisconnectReason;
             string msg = !string.IsNullOrEmpty(reason)
                 ? $"Không thể vào phòng: {reason}"
-                : (IsInRoom ? "Đã mất kết nối với Host (phòng đã đóng)." : $"Không tìm thấy phòng ID {CurrentRoomId} hoặc sai mật khẩu.");
+                : (IsInRoom ? "Đối thủ (Chủ phòng) đã thoát phòng — Bạn được xử thắng!" : $"Không tìm thấy phòng ID {CurrentRoomId} hoặc sai mật khẩu.");
 
             if (inBattleScene)
             {
-                LeaveRoom(msg);
                 OnMatchDisconnect?.Invoke(msg);
+                LeaveRoom(msg);
             }
             else
             {
@@ -1344,13 +1344,13 @@ public class MultiplayerLobbyManager : MonoBehaviour
 
     private void HandleTransportFailure()
     {
-        string msg = "Lỗi kết nối mạng (Transport Failure). Vui lòng thử lại.";
+        string msg = "Đối thủ đã mất kết nối mạng — Bạn được xử thắng!";
         bool inBattleScene = SceneManager.GetActiveScene().name.Equals(BattleSceneName, StringComparison.OrdinalIgnoreCase);
-        LeaveRoom(msg);
         if (inBattleScene)
         {
             OnMatchDisconnect?.Invoke(msg);
         }
+        LeaveRoom(msg);
     }
 
     // ==================== CUSTOM NAMED MESSAGES ====================

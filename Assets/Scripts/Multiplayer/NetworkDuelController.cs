@@ -21,6 +21,7 @@ public class NetworkDuelController : MonoBehaviour
     private const string MSG_DUEL_ACTION = "YGO_Duel_ActionRequest";
     private const string MSG_DUEL_STATUS_ONLY = "YGO_Duel_StatusFeedback";
     private const string MSG_DUEL_LEAVE = "YGO_Duel_LeaveNotify";
+    private const string MSG_DUEL_AFK_TIMER = "YGO_Duel_AfkTimer";
 
     private NetworkManager networkManager;
     private bool handlersRegistered = false;
@@ -35,11 +36,41 @@ public class NetworkDuelController : MonoBehaviour
 
     private Duel authDuel;
     private BattleManager.TurnState authTurnState = BattleManager.TurnState.DrawPhase;
+    private BattleManager.TurnState authTurnStateBeforeEndPhaseDiscard = BattleManager.TurnState.MainPhase;
     private bool hostMatchInitialized = false;
     private int snapshotSeq = 0;
 
     private readonly List<string> currentActionLogs = new List<string>();
     private readonly List<string> currentActionSfx = new List<string>();
+
+    private class AuthVfxAttackRecord
+    {
+        public int attackerSlot;
+        public int attackerZone;
+        public bool isDirectAttack;
+        public int targetSlot;
+        public int targetZone;
+    }
+
+    private class AuthVfxDestroyRecord
+    {
+        public int ownerSlot;
+        public int zoneIndex;
+        public bool isDefense;
+        public string cardName;
+    }
+
+    private class AuthVfxGodSummonRecord
+    {
+        public int ownerSlot;
+        public int zoneIndex;
+        public MonsterEffectType godEffect;
+        public string cardName;
+    }
+
+    private AuthVfxAttackRecord currentActionAttack = null;
+    private readonly List<AuthVfxDestroyRecord> currentActionDestroys = new List<AuthVfxDestroyRecord>();
+    private AuthVfxGodSummonRecord currentActionGodSummon = null;
 
     private bool isMatchOver = false;
     private int matchWinnerSlot = -1;
@@ -68,6 +99,12 @@ public class NetworkDuelController : MonoBehaviour
     private bool pendingIsDirectAttack = false;
     private bool declinedMagicalHatsThisBattlePhase = false;
     private Coroutine promptTimeoutCoroutine;
+
+    // Bộ đếm Anti-AFK trên Host (10s không có thao tác game hợp lệ -> đếm ngược 35s -> xử thua)
+    private int afkTrackedSlot = 0;
+    private float afkIdleElapsed = 0f;
+    private int lastBroadcastAfkSeconds = -1;
+    private bool remoteClientSceneReady = false;
 
     // ==================== CLIENT SYNC STATE ====================
     private bool clientReceivedSnapshot = false;
@@ -137,6 +174,7 @@ public class NetworkDuelController : MonoBehaviour
         networkManager.CustomMessagingManager.RegisterNamedMessageHandler(MSG_DUEL_ACTION, OnReceiveDuelActionRequest);
         networkManager.CustomMessagingManager.RegisterNamedMessageHandler(MSG_DUEL_STATUS_ONLY, OnReceiveStatusFeedback);
         networkManager.CustomMessagingManager.RegisterNamedMessageHandler(MSG_DUEL_LEAVE, OnReceivePlayerLeft);
+        networkManager.CustomMessagingManager.RegisterNamedMessageHandler(MSG_DUEL_AFK_TIMER, OnReceiveAfkTimerUpdate);
         handlersRegistered = true;
     }
 
@@ -149,7 +187,127 @@ public class NetworkDuelController : MonoBehaviour
         networkManager.CustomMessagingManager.UnregisterNamedMessageHandler(MSG_DUEL_ACTION);
         networkManager.CustomMessagingManager.UnregisterNamedMessageHandler(MSG_DUEL_STATUS_ONLY);
         networkManager.CustomMessagingManager.UnregisterNamedMessageHandler(MSG_DUEL_LEAVE);
+        networkManager.CustomMessagingManager.UnregisterNamedMessageHandler(MSG_DUEL_AFK_TIMER);
         handlersRegistered = false;
+    }
+
+    void Update()
+    {
+        UpdateHostAntiAfkTimer();
+    }
+
+    private int GetActiveDecisionSlot()
+    {
+        if (pendingPromptType != NetPendingPromptType.None &&
+            pendingPromptPlayerSlot >= 0 && pendingPromptPlayerSlot <= 1)
+        {
+            return pendingPromptPlayerSlot;
+        }
+        return authDuel != null ? authDuel.currentIndex : 0;
+    }
+
+    private void ResetAuthoritativeAfkTimer()
+    {
+        afkTrackedSlot = GetActiveDecisionSlot();
+        afkIdleElapsed = 0f;
+        lastBroadcastAfkSeconds = -1;
+    }
+
+    private void UpdateHostAntiAfkTimer()
+    {
+        if (!MatchSessionConfig.LocalIsHost || !hostMatchInitialized || isMatchOver || authDuel == null)
+            return;
+
+        // Chờ Client tải xong BattleScene (hoặc tối đa sau khi đã kết nối) mới bắt đầu đếm giờ
+        if (!remoteClientSceneReady)
+            return;
+
+        int activeSlot = GetActiveDecisionSlot();
+        if (activeSlot != afkTrackedSlot)
+        {
+            afkTrackedSlot = activeSlot;
+            afkIdleElapsed = 0f;
+            if (lastBroadcastAfkSeconds != -1)
+            {
+                lastBroadcastAfkSeconds = -1;
+                BroadcastAfkTimerToBoth(-1, activeSlot);
+            }
+        }
+
+        afkIdleElapsed += Time.deltaTime;
+        if (afkIdleElapsed < BattleManager.AFK_IDLE_GRACE_SECONDS)
+        {
+            if (lastBroadcastAfkSeconds != -1)
+            {
+                lastBroadcastAfkSeconds = -1;
+                BroadcastAfkTimerToBoth(-1, activeSlot);
+            }
+            return;
+        }
+
+        float countdownElapsed = afkIdleElapsed - BattleManager.AFK_IDLE_GRACE_SECONDS;
+        if (countdownElapsed >= BattleManager.AFK_COUNTDOWN_SECONDS)
+        {
+            int loserSlot = activeSlot;
+            int winnerSlot = 1 - loserSlot;
+            string loserName = (authPlayers[loserSlot] != null && !string.IsNullOrWhiteSpace(authPlayers[loserSlot].name))
+                ? authPlayers[loserSlot].name
+                : "Đối thủ";
+
+            lastBroadcastAfkSeconds = -1;
+            DeclareAuthoritativeGameOver(winnerSlot, $"{loserName} bị xử thua do không thao tác quá thời gian quy định (Anti-AFK)!");
+            BroadcastSnapshotsToBoth(matchOverReason);
+            return;
+        }
+
+        int remainSec = Mathf.CeilToInt(Mathf.Max(1f, BattleManager.AFK_COUNTDOWN_SECONDS - countdownElapsed));
+        if (remainSec != lastBroadcastAfkSeconds)
+        {
+            lastBroadcastAfkSeconds = remainSec;
+            BroadcastAfkTimerToBoth(remainSec, activeSlot);
+        }
+    }
+
+    private void BroadcastAfkTimerToBoth(int remainingSeconds, int activeSlot)
+    {
+        string targetName = (activeSlot >= 0 && activeSlot <= 1 && authPlayers[activeSlot] != null)
+            ? authPlayers[activeSlot].name
+            : "";
+
+        if (BattleManager.Instance != null)
+        {
+            BattleManager.Instance.UpdateAfkCountdownBanner(
+                remainingSeconds,
+                isForLocalPlayer: (activeSlot == 0),
+                targetPlayerName: targetName
+            );
+        }
+
+        if (networkManager == null || !networkManager.IsServer || !networkManager.IsListening) return;
+        ulong clientId = ResolveRemoteClientId();
+        if (clientId != ulong.MaxValue && clientId != NetworkManager.ServerClientId &&
+            networkManager.ConnectedClientsIds != null && networkManager.ConnectedClientsIds.Contains(clientId))
+        {
+            SendJsonMessage(MSG_DUEL_AFK_TIMER, clientId, new NetAfkTimerDto
+            {
+                remainingSeconds = remainingSeconds,
+                isForMe = (activeSlot == 1),
+                targetPlayerName = targetName
+            });
+        }
+    }
+
+    private void OnReceiveAfkTimerUpdate(ulong senderClientId, FastBufferReader reader)
+    {
+        if (MatchSessionConfig.LocalIsHost) return;
+        NetAfkTimerDto dto = ReadJsonMessage<NetAfkTimerDto>(reader);
+        if (dto == null || BattleManager.Instance == null) return;
+
+        BattleManager.Instance.UpdateAfkCountdownBanner(
+            dto.remainingSeconds,
+            isForLocalPlayer: dto.isForMe,
+            targetPlayerName: dto.targetPlayerName
+        );
     }
 
     // ==================== GỬI YÊU CẦU HÀNH ĐỘNG TỪ NGƯỜI CHƠI ====================
@@ -207,9 +365,14 @@ public class NetworkDuelController : MonoBehaviour
     {
         if (bm == null) return;
 
-        int startLP = bm.startingLP > 0 ? bm.startingLP : 4000;
-        string hostName = string.IsNullOrWhiteSpace(MatchSessionConfig.HostPlayerName) ? "Host" : MatchSessionConfig.HostPlayerName;
-        string clientName = string.IsNullOrWhiteSpace(MatchSessionConfig.ClientPlayerName) ? "Client" : MatchSessionConfig.ClientPlayerName;
+        int startLP = bm.startingLP > 4000 ? bm.startingLP : 8000;
+        string hostName = string.IsNullOrWhiteSpace(MatchSessionConfig.HostPlayerName) ? "Host" : MatchSessionConfig.HostPlayerName.Trim();
+        string clientName = string.IsNullOrWhiteSpace(MatchSessionConfig.ClientPlayerName) ? "Client" : MatchSessionConfig.ClientPlayerName.Trim();
+        if (string.Equals(hostName, clientName, StringComparison.OrdinalIgnoreCase))
+        {
+            hostName = $"{hostName} (P1)";
+            clientName = $"{clientName} (P2)";
+        }
 
         for (int s = 0; s < 2; s++)
         {
@@ -249,6 +412,9 @@ public class NetworkDuelController : MonoBehaviour
         declinedMagicalHatsThisBattlePhase = false;
         currentActionLogs.Clear();
         currentActionSfx.Clear();
+        currentActionAttack = null;
+        currentActionDestroys.Clear();
+        currentActionGodSummon = null;
 
         authDuel = new Duel(authPlayers[0], authPlayers[1]);
         authDuel.currentIndex = nextStartingPlayerSlot;
@@ -268,6 +434,9 @@ public class NetworkDuelController : MonoBehaviour
 
         currentActionLogs.Clear();
         currentActionSfx.Clear();
+        currentActionAttack = null;
+        currentActionDestroys.Clear();
+        currentActionGodSummon = null;
         QueueSfx("Draw");
 
         Debug.Log($"[NetworkDuel][Host] Đã khởi tạo Duel 1v1! {hostName} (Tay:{authHands[0].Count}, Deck:{authDecks[0].Count}) vs {clientName} (Tay:{authHands[1].Count}, Deck:{authDecks[1].Count}). Lượt 1: {authDuel.Current.name}");
@@ -287,15 +456,59 @@ public class NetworkDuelController : MonoBehaviour
             }
         };
 
-        authDuel.OnSummoned += _ => QueueSfx("Summon");
+        authDuel.OnSummoned += summoned =>
+        {
+            QueueSfx("Summon");
+            if (summoned != null && !summoned.IsFaceDown && summoned.data != null && summoned.data.IsDivineGod)
+            {
+                currentActionGodSummon = new AuthVfxGodSummonRecord
+                {
+                    ownerSlot = GetPlayerSlot(summoned.owner),
+                    zoneIndex = summoned.zoneIndex,
+                    godEffect = summoned.data.monsterEffect,
+                    cardName = summoned.data.cardName
+                };
+            }
+        };
         authDuel.OnSpellActivated += _ => QueueSfx("Spell");
-        authDuel.OnAttackDeclared += (_, __) => QueueSfx("Attack");
+        authDuel.OnAttackDeclared += (attacker, target) =>
+        {
+            QueueSfx("Attack");
+            if (attacker != null)
+            {
+                int atkSlot = GetPlayerSlot(attacker.owner);
+                int tgtSlot = target != null ? GetPlayerSlot(target.owner) : (1 - atkSlot);
+                currentActionAttack = new AuthVfxAttackRecord
+                {
+                    attackerSlot = atkSlot,
+                    attackerZone = attacker.zoneIndex,
+                    isDirectAttack = (target == null),
+                    targetSlot = tgtSlot,
+                    targetZone = target != null ? target.zoneIndex : -1
+                };
+            }
+        };
         authDuel.OnPositionChanged += _ => QueueSfx("Summon");
 
         authDuel.OnDamage += (damagedPlayer, amount) =>
         {
             if (amount > 0) QueueSfx("Damage");
             CheckAuthoritativeLPGameOver();
+        };
+
+        authDuel.OnMonsterShattered += shatteredCard =>
+        {
+            if (shatteredCard == null) return;
+            string resolvedName = shatteredCard.isMagicalHatDecoy
+                ? (shatteredCard.originalSpellTrapData != null ? shatteredCard.originalSpellTrapData.cardName : "")
+                : (shatteredCard.data != null ? shatteredCard.data.cardName : "");
+            currentActionDestroys.Add(new AuthVfxDestroyRecord
+            {
+                ownerSlot = GetPlayerSlot(shatteredCard.owner),
+                zoneIndex = shatteredCard.zoneIndex,
+                isDefense = shatteredCard.IsDefense,
+                cardName = resolvedName
+            });
         };
 
         authDuel.OnDestroyed += destroyedCard =>
@@ -323,6 +536,7 @@ public class NetworkDuelController : MonoBehaviour
             if (data == null) return;
             int slot = GetPlayerSlot(owner);
             authHands[slot].Add(data);
+            SyncAuthoritativeHandCounts();
         };
 
         authDuel.OnSearchMonsterFromDeck += HandleAuthoritativeSearchMonsterFromDeck;
@@ -337,6 +551,17 @@ public class NetworkDuelController : MonoBehaviour
 
         authDuel.OnSwordsExpired += HandleAuthoritativeSwordsExpired;
         authDuel.OnTriggerFlipGraveyardToDeck += HandleAuthoritativeFlipGraveyardToDeck;
+    }
+
+    private void SyncAuthoritativeHandCounts()
+    {
+        for (int s = 0; s < 2; s++)
+        {
+            if (authPlayers[s] != null && authHands[s] != null)
+            {
+                authPlayers[s].handCount = authHands[s].Count;
+            }
+        }
     }
 
     private int GetPlayerSlot(Player p)
@@ -376,7 +601,7 @@ public class NetworkDuelController : MonoBehaviour
             {
                 int winner = 1 - playerSlot;
                 string loserName = authPlayers[playerSlot].name;
-                DeclareAuthoritativeGameOver(winner, $"{loserName} đã hết bài để rút (Deck Out)!");
+                DeclareAuthoritativeGameOver(winner, $"{loserName} không thể rút bài vì Deck đã hết bài (Deck Out)!");
             }
             return false;
         }
@@ -384,6 +609,7 @@ public class NetworkDuelController : MonoBehaviour
         CardData top = deck[0];
         deck.RemoveAt(0);
         hand.Add(top);
+        SyncAuthoritativeHandCounts();
         return true;
     }
 
@@ -457,8 +683,19 @@ public class NetworkDuelController : MonoBehaviour
         }
 
         int enemySlot = 1 - playerSlot;
+
+        // Nếu đang ở cửa sổ phản ứng Hang Rơi (Trap Hole) khi đối thủ vừa Triệu hồi Thường / Lật
+        if (pendingPromptType == NetPendingPromptType.TrapHoleOnSummon)
+        {
+            MonsterCard summonedTarget = (pendingAttackActorSlot >= 0 && pendingAttackActorSlot <= 1 &&
+                                          pendingTargetZone >= 0 && pendingTargetZone < Player.ZoneCount)
+                ? authPlayers[pendingAttackActorSlot].monsterZones[pendingTargetZone]
+                : null;
+            return Duel.CanActivateTrapHoleOnSummon(card, summonedTarget, out failReason);
+        }
+
         bool deckHasSpellTrap = authDecks[playerSlot].Any(c => c != null && c.IsSpellOrTrap);
-        bool gyHasMonster = authGraveyards[playerSlot].Any(c => c != null && c.cardType == CardType.Monster);
+        bool gyHasMonster = authGraveyards[playerSlot].Any(c => c != null && c.cardType == CardType.Monster && !c.CannotBeSpecialSummoned);
 
         return Duel.CanActivateSpellOrTrap(
             card,
@@ -476,6 +713,26 @@ public class NetworkDuelController : MonoBehaviour
         for (int i = 0; i < Player.ZoneCount; i++)
         {
             if (CanAuthoritativeSetCardReact(playerSlot, i, out _))
+                return true;
+        }
+        if (authHands[playerSlot] != null &&
+            authHands[playerSlot].Any(c => c != null && c.cardType == CardType.Monster && c.monsterEffect == MonsterEffectType.KuribohHandGuard))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    private bool HasAuthoritativeActivatableTrapHoleOnSummon(int defenderSlot, MonsterCard summonedMonster)
+    {
+        if (defenderSlot < 0 || defenderSlot > 1 || summonedMonster == null || summonedMonster.IsFaceDown)
+            return false;
+
+        for (int i = 0; i < Player.ZoneCount; i++)
+        {
+            CardData card = authSpellZones[defenderSlot][i];
+            bool isFaceDown = authSpellFaceDown[defenderSlot][i];
+            if (card != null && isFaceDown && Duel.CanActivateTrapHoleOnSummon(card, summonedMonster, out _))
                 return true;
         }
         return false;
@@ -542,6 +799,7 @@ public class NetworkDuelController : MonoBehaviour
         {
             deck.Remove(target);
             hand.Add(target);
+            SyncAuthoritativeHandCounts();
             ShuffleDeck(deck);
         }
         return target;
@@ -634,21 +892,8 @@ public class NetworkDuelController : MonoBehaviour
 
     private IEnumerator PromptTimeoutRoutine(int watchedPromptId, float timeoutSeconds)
     {
-        yield return new WaitForSeconds(timeoutSeconds);
-
-        if (isMatchOver || pendingPromptType == NetPendingPromptType.None || pendingPromptId != watchedPromptId)
-            yield break;
-
-        Debug.Log($"[NetworkDuel][Host] Hết thời gian chờ phản hồi Prompt #{watchedPromptId} ({pendingPromptType}) -> Tự xử lý mặc định.");
-
-        int responderSlot = pendingPromptPlayerSlot;
-        ExecuteAuthoritativePromptResponse(responderSlot, new NetDuelActionRequest
-        {
-            actionType = (int)NetDuelActionType.RespondPromptChoice,
-            promptId = watchedPromptId,
-            myZoneIndex = -1,       // -1 = Không kích hoạt bài úp (Bỏ qua)
-            graveyardTargetIndex = 0 // 0 = Lá đầu tiên trong Mộ (với FLIP)
-        });
+        // Bộ đếm Anti-AFK (10s không thao tác + 35s đếm ngược = 45s xử thua) đã quản lý toàn bộ thời gian chờ phản hồi.
+        yield break;
     }
 
     // ==================== XỬ LÝ HÀNH ĐỘNG TRÊN HOST (BƯỚC 4 & 5) ====================
@@ -690,7 +935,7 @@ public class NetworkDuelController : MonoBehaviour
                 ExecuteAuthoritativePromptResponse(actorSlot, req);
             }
             else if (actionType == NetDuelActionType.ActivateSetSpellTrap &&
-                     pendingPromptType == NetPendingPromptType.TrapMagicalHats &&
+                     (pendingPromptType == NetPendingPromptType.TrapMagicalHats || pendingPromptType == NetPendingPromptType.TrapHoleOnSummon) &&
                      actorSlot == pendingPromptPlayerSlot)
             {
                 // Người phòng thủ bấm trực tiếp vào ô bài úp trên sân
@@ -725,8 +970,17 @@ public class NetworkDuelController : MonoBehaviour
             return;
         }
 
+        // Bảo vệ trạng thái Phase: Khi không có Prompt và trận chưa kết thúc, chỉ có thể ở MainPhase hoặc BattlePhase
+        if (authTurnState != BattleManager.TurnState.MainPhase && authTurnState != BattleManager.TurnState.BattlePhase)
+        {
+            authTurnState = BattleManager.TurnState.MainPhase;
+        }
+
         currentActionLogs.Clear();
         currentActionSfx.Clear();
+        currentActionAttack = null;
+        currentActionDestroys.Clear();
+        currentActionGodSummon = null;
 
         switch (actionType)
         {
@@ -765,7 +1019,76 @@ public class NetworkDuelController : MonoBehaviour
             case NetDuelActionType.ActivateSetSpellTrap:
                 ExecuteAuthoritativeActivateSetSpell(actorSlot, actor, req);
                 break;
+
+            case NetDuelActionType.ActivateMonsterFieldEffect:
+                ExecuteAuthoritativeActivateMonsterFieldEffect(actorSlot, actor, req);
+                break;
         }
+    }
+
+    private void ExecuteAuthoritativeActivateMonsterFieldEffect(int actorSlot, Player actor, NetDuelActionRequest req)
+    {
+        if (authTurnState != BattleManager.TurnState.MainPhase)
+        {
+            SendStatusFeedbackToSlot(actorSlot, "Chỉ có thể kích hoạt hiệu ứng quái thú trong Main Phase!");
+            return;
+        }
+
+        if (req.myZoneIndex < 0 || req.myZoneIndex >= Player.ZoneCount) return;
+
+        MonsterCard monster = actor.monsterZones[req.myZoneIndex];
+        if (monster == null || monster.IsFaceDown || monster.data == null)
+        {
+            SendStatusFeedbackToSlot(actorSlot, "Quái thú phải đang ngửa trên sân mới có thể kích hoạt hiệu ứng!");
+            return;
+        }
+
+        bool ok = false;
+        if (monster.data.monsterEffect == MonsterEffectType.DivineObelisk)
+        {
+            List<MonsterCard> sacrifices = new List<MonsterCard>();
+            if (req.tributeZones != null)
+            {
+                foreach (int z in req.tributeZones.Distinct())
+                {
+                    if (z >= 0 && z < Player.ZoneCount && actor.monsterZones[z] != null)
+                    {
+                        sacrifices.Add(actor.monsterZones[z]);
+                    }
+                }
+            }
+            ok = authDuel.ActivateObeliskSoulEnergyMax(actor, monster, sacrifices);
+        }
+        else if (monster.data.monsterEffect == MonsterEffectType.DivineRa)
+        {
+            if (req.preferredZone == 1)
+            {
+                ok = authDuel.ActivateRaPointToPointTransfer(actor, monster);
+            }
+            else
+            {
+                Player targetOwner = (req.preferredZone == 2) ? actor : authPlayers[1 - actorSlot];
+                MonsterCard target = (req.targetOpponentZone >= 0 && req.targetOpponentZone < Player.ZoneCount)
+                    ? targetOwner.monsterZones[req.targetOpponentZone]
+                    : null;
+                ok = authDuel.ActivateRaPhoenixDestroy(actor, monster, target);
+            }
+        }
+        else
+        {
+            SendStatusFeedbackToSlot(actorSlot, $"[{monster.data.cardName}] không có hiệu ứng kích hoạt chủ động trên sân.");
+            return;
+        }
+
+        if (!ok)
+        {
+            SendStatusFeedbackToSlot(actorSlot, BuildCombinedActionLog("Chưa đủ điều kiện kích hoạt hiệu ứng quái thú này."));
+            return;
+        }
+
+        QueueSfx("Spell");
+        CheckAuthoritativeLPGameOver();
+        BroadcastSnapshotsToBoth(BuildCombinedActionLog());
     }
 
     // ==================== THỰC THI BÀI PHÉP / BẪY & ASYNC PROMPTS (BƯỚC 5) ====================
@@ -792,6 +1115,7 @@ public class NetworkDuelController : MonoBehaviour
         }
 
         hand.RemoveAt(req.handIndex);
+        SyncAuthoritativeHandCounts();
         authSpellZones[actorSlot][spellZone] = spellCard.Clone();
         authSpellFaceDown[actorSlot][spellZone] = true;
 
@@ -847,7 +1171,8 @@ public class NetworkDuelController : MonoBehaviour
 
             List<CardData> gy = authGraveyards[actorSlot];
             if (req.graveyardTargetIndex < 0 || req.graveyardTargetIndex >= gy.Count ||
-                gy[req.graveyardTargetIndex].cardType != CardType.Monster)
+                gy[req.graveyardTargetIndex].cardType != CardType.Monster ||
+                gy[req.graveyardTargetIndex].CannotBeSpecialSummoned)
             {
                 SendStatusFeedbackToSlot(actorSlot, "Mục tiêu hồi sinh trong Mộ bài không hợp lệ!");
                 return;
@@ -858,6 +1183,7 @@ public class NetworkDuelController : MonoBehaviour
 
             CardData activeSpell = spellCard.Clone();
             hand.RemoveAt(req.handIndex);
+            SyncAuthoritativeHandCounts();
             authSpellZones[actorSlot][spellZone] = activeSpell;
             authSpellFaceDown[actorSlot][spellZone] = false;
 
@@ -881,6 +1207,7 @@ public class NetworkDuelController : MonoBehaviour
         }
 
         hand.RemoveAt(req.handIndex);
+        SyncAuthoritativeHandCounts();
         authSpellZones[actorSlot][spellZone] = spellInstance;
         authSpellFaceDown[actorSlot][spellZone] = false;
 
@@ -942,7 +1269,8 @@ public class NetworkDuelController : MonoBehaviour
 
             List<CardData> gy = authGraveyards[actorSlot];
             if (req.graveyardTargetIndex < 0 || req.graveyardTargetIndex >= gy.Count ||
-                gy[req.graveyardTargetIndex].cardType != CardType.Monster)
+                gy[req.graveyardTargetIndex].cardType != CardType.Monster ||
+                gy[req.graveyardTargetIndex].CannotBeSpecialSummoned)
             {
                 SendStatusFeedbackToSlot(actorSlot, "Mục tiêu hồi sinh trong Mộ bài không hợp lệ!");
                 return;
@@ -994,6 +1322,9 @@ public class NetworkDuelController : MonoBehaviour
         ClearPendingPromptState();
         currentActionLogs.Clear();
         currentActionSfx.Clear();
+        currentActionAttack = null;
+        currentActionDestroys.Clear();
+        currentActionGodSummon = null;
 
         if (handledType == NetPendingPromptType.FlipSelectGraveyardToDeck)
         {
@@ -1029,6 +1360,25 @@ public class NetworkDuelController : MonoBehaviour
             Player defender = authPlayers[responderSlot];
             Player attackerOwner = (atkActorSlot >= 0 && atkActorSlot <= 1) ? authPlayers[atkActorSlot] : authPlayers[1 - responderSlot];
 
+            // Trường hợp đặc biệt: Kích hoạt Kuriboh từ trên tay (Hiệu ứng nhanh chặn 100% sát thương chiến đấu)
+            if (chosenSpellZone == BattleManager.KURIBOH_HAND_REACTION_ZONE)
+            {
+                List<CardData> hand = authHands[responderSlot];
+                int kIdx = hand.FindIndex(c => c != null && c.cardType == CardType.Monster && c.monsterEffect == MonsterEffectType.KuribohHandGuard);
+                if (kIdx >= 0)
+                {
+                    CardData kuriboh = hand[kIdx];
+                    hand.RemoveAt(kIdx);
+                    SyncAuthoritativeHandCounts();
+                    authGraveyards[responderSlot].Add(kuriboh);
+                    defender.kuribohShieldActive = true;
+                    QueueSfx("Spell");
+                    currentActionLogs.Add($"[Hiệu ứng nhanh - {kuriboh.cardName}] {defender.name} gửi {kuriboh.cardName} từ tay xuống Mộ: Mọi sát thương chiến đấu từ đòn đánh này giảm xuống 0!");
+                }
+                ResolveAuthoritativePausedAttack(atkActorSlot, atkZone, tgtZone, isDirectAtk);
+                return;
+            }
+
             if (chosenSpellZone >= 0 && chosenSpellZone < Player.ZoneCount &&
                 CanAuthoritativeSetCardReact(responderSlot, chosenSpellZone, out _))
             {
@@ -1038,9 +1388,11 @@ public class NetworkDuelController : MonoBehaviour
                 if (setCard.spellEffect == SpellEffectType.ReviveFromGraveyard)
                 {
                     List<CardData> gy = authGraveyards[responderSlot];
-                    int gyIdx = (req.graveyardTargetIndex >= 0 && req.graveyardTargetIndex < gy.Count && gy[req.graveyardTargetIndex].cardType == CardType.Monster)
+                    int gyIdx = (req.graveyardTargetIndex >= 0 && req.graveyardTargetIndex < gy.Count &&
+                                 gy[req.graveyardTargetIndex].cardType == CardType.Monster &&
+                                 !gy[req.graveyardTargetIndex].CannotBeSpecialSummoned)
                         ? req.graveyardTargetIndex
-                        : gy.FindIndex(c => c != null && c.cardType == CardType.Monster);
+                        : gy.FindIndex(c => c != null && c.cardType == CardType.Monster && !c.CannotBeSpecialSummoned);
 
                     if (gyIdx >= 0 && defender.FirstEmptyZone() >= 0)
                     {
@@ -1110,6 +1462,128 @@ public class NetworkDuelController : MonoBehaviour
 
             // Nếu người phòng thủ chọn BỎ QUA hoặc lá bài phép không làm hủy đòn đánh (ví dụ rút bài/tăng ATK/hồi LP) -> Tiếp tục giải quyết đòn tấn công!
             ResolveAuthoritativePausedAttack(atkActorSlot, atkZone, tgtZone, isDirectAtk);
+            return;
+        }
+
+        if (handledType == NetPendingPromptType.TrapHoleOnSummon)
+        {
+            int chosenSpellZone = req.myZoneIndex;
+            Player defender = authPlayers[responderSlot];
+            int summonActorSlot = (atkActorSlot >= 0 && atkActorSlot <= 1) ? atkActorSlot : (1 - responderSlot);
+            Player summonOwner = authPlayers[summonActorSlot];
+            MonsterCard summonedTarget = (tgtZone >= 0 && tgtZone < Player.ZoneCount)
+                ? summonOwner.monsterZones[tgtZone]
+                : null;
+
+            if (chosenSpellZone >= 0 && chosenSpellZone < Player.ZoneCount &&
+                summonedTarget != null &&
+                Duel.CanActivateTrapHoleOnSummon(authSpellZones[responderSlot][chosenSpellZone], summonedTarget, out _))
+            {
+                CardData trapCard = authSpellZones[responderSlot][chosenSpellZone];
+                if (authDuel.ActivateTrapHoleOnSummon(defender, trapCard, summonedTarget))
+                {
+                    authSpellFaceDown[responderSlot][chosenSpellZone] = false;
+                    ScheduleTransientSpellClear(responderSlot, chosenSpellZone, trapCard);
+                    CheckAuthoritativeLPGameOver();
+                    BroadcastSnapshotsToBoth(BuildCombinedActionLog());
+                    return;
+                }
+            }
+
+            // Nếu người phòng thủ bỏ qua Hang Rơi và quái vừa triệu hồi là Thần Ra -> hỏi người triệu hồi có trả LP còn 100 không
+            if (summonedTarget != null &&
+                summonOwner.monsterZones[tgtZone] == summonedTarget &&
+                summonedTarget.data != null &&
+                summonedTarget.data.monsterEffect == MonsterEffectType.DivineRa &&
+                !summonedTarget.isSpecialSummoned &&
+                summonOwner.lifePoints > 100)
+            {
+                pendingPromptType = NetPendingPromptType.RaSummonPayLP;
+                pendingPromptId++;
+                pendingPromptPlayerSlot = summonActorSlot;
+                pendingAttackerZone = tgtZone;
+
+                if (promptTimeoutCoroutine != null) StopCoroutine(promptTimeoutCoroutine);
+                promptTimeoutCoroutine = StartCoroutine(PromptTimeoutRoutine(pendingPromptId, 15f));
+
+                BroadcastSnapshotsToBoth($"[{summonedTarget.data.cardName}] Đang chờ {summonOwner.name} chọn có trả LP xuống còn 100 để truyền ATK/DEF không...");
+                return;
+            }
+
+            BroadcastSnapshotsToBoth(BuildCombinedActionLog());
+            return;
+        }
+
+        if (handledType == NetPendingPromptType.RaSummonPayLP)
+        {
+            Player responder = authPlayers[responderSlot];
+            MonsterCard raCard = (atkZone >= 0 && atkZone < Player.ZoneCount)
+                ? responder.monsterZones[atkZone]
+                : null;
+
+            if (req.myZoneIndex == 1 && raCard != null &&
+                raCard.data != null && raCard.data.monsterEffect == MonsterEffectType.DivineRa)
+            {
+                if (authDuel.ActivateRaPointToPointTransfer(responder, raCard))
+                {
+                    QueueSfx("Spell");
+                }
+            }
+
+            CheckAuthoritativeLPGameOver();
+            BroadcastSnapshotsToBoth(BuildCombinedActionLog());
+            return;
+        }
+
+        if (handledType == NetPendingPromptType.EndPhaseDiscardHand)
+        {
+            List<CardData> hand = authHands[responderSlot];
+            List<CardData> gy = authGraveyards[responderSlot];
+            Player responder = authPlayers[responderSlot];
+
+            // Người chơi bấm "HỦY KẾT THÚC LƯỢT (QUAY LẠI)" -> quay lại Main Phase / Battle Phase để tiếp tục triệu hồi quái hoặc dùng bài phép
+            if (req.graveyardTargetIndex < 0)
+            {
+                authTurnState = (authTurnStateBeforeEndPhaseDiscard == BattleManager.TurnState.BattlePhase)
+                    ? BattleManager.TurnState.BattlePhase
+                    : BattleManager.TurnState.MainPhase;
+                string phaseLabel = authTurnState == BattleManager.TurnState.BattlePhase ? "Battle Phase" : "Main Phase";
+                BroadcastSnapshotsToBoth($"Đã hủy Kết thúc lượt — {responder.name} quay lại {phaseLabel} để tiếp tục thao tác!");
+                return;
+            }
+
+            if (hand.Count > BattleManager.MAX_HAND_SIZE_END_PHASE)
+            {
+                int idx = (req.graveyardTargetIndex >= 0 && req.graveyardTargetIndex < hand.Count)
+                    ? req.graveyardTargetIndex
+                    : 0;
+                CardData discarded = hand[idx];
+                hand.RemoveAt(idx);
+                SyncAuthoritativeHandCounts();
+                if (discarded != null)
+                {
+                    gy.Add(discarded);
+                }
+                QueueSfx("Summon");
+
+                if (hand.Count > BattleManager.MAX_HAND_SIZE_END_PHASE)
+                {
+                    int remainExcess = hand.Count - BattleManager.MAX_HAND_SIZE_END_PHASE;
+                    pendingPromptType = NetPendingPromptType.EndPhaseDiscardHand;
+                    pendingPromptId++;
+                    pendingPromptPlayerSlot = responderSlot;
+
+                    BroadcastSnapshotsToBoth(
+                        $"[End Phase] {responder.name} đã bỏ [{discarded.cardName}] xuống Mộ. Cần chọn bỏ thêm {remainExcess} lá nữa (còn {hand.Count}/{BattleManager.MAX_HAND_SIZE_END_PHASE} lá)!"
+                    );
+                    return;
+                }
+
+                currentActionLogs.Add($"[End Phase] {responder.name} đã bỏ [{discarded.cardName}] xuống Mộ (trên tay còn đúng {hand.Count} lá).");
+            }
+
+            FinishAuthoritativeEndTurn();
+            return;
         }
     }
 
@@ -1150,23 +1624,67 @@ public class NetworkDuelController : MonoBehaviour
         }
 
         BattlePosition pos = (BattlePosition)req.position;
+        hand.RemoveAt(req.handIndex);
+        SyncAuthoritativeHandCounts();
+
         MonsterCard summoned = authDuel.Summon(actor, cardToSummon.Clone(), pos, tributes, isSpecial: false, preferredZone: req.preferredZone);
         if (summoned == null)
         {
+            hand.Insert(Mathf.Clamp(req.handIndex, 0, hand.Count), cardToSummon);
+            SyncAuthoritativeHandCounts();
             SendStatusFeedbackToSlot(actorSlot, BuildCombinedActionLog("Không thể triệu hồi quái thú này."));
             return;
         }
 
-        hand.RemoveAt(req.handIndex);
         foreach (var t in tributes)
         {
-            if (t != null && t.data != null)
+            if (t != null && t.data != null && !t.isMagicalHatDecoy)
             {
                 authGraveyards[actorSlot].Add(t.data);
             }
         }
 
         CheckAuthoritativeLPGameOver();
+
+        int defenderSlot = 1 - actorSlot;
+        bool stillOnFieldFaceUp = !isMatchOver && !summoned.IsFaceDown &&
+                                  summoned.zoneIndex >= 0 && summoned.zoneIndex < Player.ZoneCount &&
+                                  actor.monsterZones[summoned.zoneIndex] == summoned;
+
+        // 1. Kiểm tra nếu đối thủ có Hang Rơi (Trap Hole) đặt úp và quái vừa triệu hồi thường có ATK >= 1000 (không áp dụng cho 3 Thần Ai Cập)
+        if (stillOnFieldFaceUp && !summoned.data.IsDivineGod &&
+            pendingPromptType == NetPendingPromptType.None &&
+            HasAuthoritativeActivatableTrapHoleOnSummon(defenderSlot, summoned))
+        {
+            pendingPromptType = NetPendingPromptType.TrapHoleOnSummon;
+            pendingPromptId++;
+            pendingPromptPlayerSlot = defenderSlot;
+            pendingAttackActorSlot = actorSlot;
+            pendingTargetZone = summoned.zoneIndex;
+
+            if (promptTimeoutCoroutine != null) StopCoroutine(promptTimeoutCoroutine);
+            promptTimeoutCoroutine = StartCoroutine(PromptTimeoutRoutine(pendingPromptId, 15f));
+
+            BroadcastSnapshotsToBoth(BuildCombinedActionLog($"{actor.name} vừa triệu hồi [{summoned.data.cardName}] (ATK {summoned.Atk})! Đang chờ {authPlayers[defenderSlot].name} phản hồi Bẫy..."));
+            return;
+        }
+
+        // 2. Nếu là Rồng Cánh Thần Của Ra vừa Triệu hồi Thường -> Hỏi người chơi có trả LP xuống còn 100 để cộng ATK/DEF không
+        if (stillOnFieldFaceUp && summoned.data.monsterEffect == MonsterEffectType.DivineRa &&
+            actor.lifePoints > 100 && pendingPromptType == NetPendingPromptType.None)
+        {
+            pendingPromptType = NetPendingPromptType.RaSummonPayLP;
+            pendingPromptId++;
+            pendingPromptPlayerSlot = actorSlot;
+            pendingAttackerZone = summoned.zoneIndex;
+
+            if (promptTimeoutCoroutine != null) StopCoroutine(promptTimeoutCoroutine);
+            promptTimeoutCoroutine = StartCoroutine(PromptTimeoutRoutine(pendingPromptId, 15f));
+
+            BroadcastSnapshotsToBoth(BuildCombinedActionLog($"[{summoned.data.cardName}] Đang chờ {actor.name} chọn có trả LP xuống còn 100 để truyền ATK/DEF không..."));
+            return;
+        }
+
         BroadcastSnapshotsToBoth(BuildCombinedActionLog());
     }
 
@@ -1186,6 +1704,7 @@ public class NetworkDuelController : MonoBehaviour
         MonsterCard card = actor.monsterZones[req.myZoneIndex];
         if (card == null) return;
 
+        bool wasFaceDown = card.IsFaceDown;
         bool changed = authDuel.ChangePosition(actor, card);
         if (!changed)
         {
@@ -1194,6 +1713,27 @@ public class NetworkDuelController : MonoBehaviour
         }
 
         CheckAuthoritativeLPGameOver();
+
+        int defenderSlot = 1 - actorSlot;
+        if (!isMatchOver && wasFaceDown && !card.IsFaceDown &&
+            card.zoneIndex >= 0 && card.zoneIndex < Player.ZoneCount &&
+            actor.monsterZones[card.zoneIndex] == card &&
+            pendingPromptType == NetPendingPromptType.None &&
+            HasAuthoritativeActivatableTrapHoleOnSummon(defenderSlot, card))
+        {
+            pendingPromptType = NetPendingPromptType.TrapHoleOnSummon;
+            pendingPromptId++;
+            pendingPromptPlayerSlot = defenderSlot;
+            pendingAttackActorSlot = actorSlot;
+            pendingTargetZone = card.zoneIndex;
+
+            if (promptTimeoutCoroutine != null) StopCoroutine(promptTimeoutCoroutine);
+            promptTimeoutCoroutine = StartCoroutine(PromptTimeoutRoutine(pendingPromptId, 15f));
+
+            BroadcastSnapshotsToBoth(BuildCombinedActionLog($"{actor.name} vừa lật triệu hồi [{card.data.cardName}] (ATK {card.Atk})! Đang chờ {authPlayers[defenderSlot].name} phản hồi Bẫy..."));
+            return;
+        }
+
         BroadcastSnapshotsToBoth(BuildCombinedActionLog());
     }
 
@@ -1396,10 +1936,32 @@ public class NetworkDuelController : MonoBehaviour
     {
         if (authTurnState != BattleManager.TurnState.MainPhase && authTurnState != BattleManager.TurnState.BattlePhase)
         {
+            authTurnState = BattleManager.TurnState.MainPhase;
+        }
+
+        authTurnStateBeforeEndPhaseDiscard = authTurnState;
+        declinedMagicalHatsThisBattlePhase = false;
+
+        // Luật End Phase: Nếu người chơi đang kết thúc lượt có nhiều hơn 6 lá bài trên tay -> bắt buộc chọn bỏ xuống Mộ cho tới khi còn đúng 6 lá
+        List<CardData> hand = authHands[actorSlot];
+        if (hand != null && hand.Count > BattleManager.MAX_HAND_SIZE_END_PHASE)
+        {
+            int excess = hand.Count - BattleManager.MAX_HAND_SIZE_END_PHASE;
+            pendingPromptType = NetPendingPromptType.EndPhaseDiscardHand;
+            pendingPromptId++;
+            pendingPromptPlayerSlot = actorSlot;
+
+            BroadcastSnapshotsToBoth(
+                $"[End Phase] {authPlayers[actorSlot].name} đang có {hand.Count} lá trên tay — Bắt buộc chọn bỏ {excess} lá xuống Mộ (giới hạn {BattleManager.MAX_HAND_SIZE_END_PHASE} lá)!"
+            );
             return;
         }
 
-        declinedMagicalHatsThisBattlePhase = false;
+        FinishAuthoritativeEndTurn();
+    }
+
+    private void FinishAuthoritativeEndTurn()
+    {
         authTurnState = BattleManager.TurnState.EndPhase;
         authDuel.EndTurn();
 
@@ -1465,6 +2027,7 @@ public class NetworkDuelController : MonoBehaviour
 
     public MatchStateSnapshot BuildSnapshotForViewer(int viewerSlot, string customStatus = null)
     {
+        SyncAuthoritativeHandCounts();
         int oppSlot = 1 - viewerSlot;
         Player me = authPlayers[viewerSlot];
         Player opp = authPlayers[oppSlot];
@@ -1502,7 +2065,35 @@ public class NetworkDuelController : MonoBehaviour
                 : null;
             string atkLabel = atkCard != null ? $"[{atkCard.data.cardName}] (ATK {atkCard.Atk})" : "Quái thú";
             string targetLabel = pendingIsDirectAttack ? "trực tiếp vào LP của bạn" : "quái thú của bạn";
-            promptTitleStr = $"{opp.name} dùng {atkLabel} tấn công {targetLabel}!\nCHỌN 1 LÁ BÀI PHÉP / BẪY ĐANG ÚP ĐỂ KÍCH HOẠT HOẶC BỎ QUA";
+            promptTitleStr = $"{opp.name} dùng {atkLabel} tấn công {targetLabel}!\nCHỌN 1 LÁ BÀI PHÉP / BẪY ĐANG ÚP (HOẶC KURIBOH TRÊN TAY) ĐỂ KÍCH HOẠT";
+        }
+        else if (pendingPromptType == NetPendingPromptType.TrapHoleOnSummon)
+        {
+            MonsterCard sumCard = (pendingAttackActorSlot >= 0 && pendingAttackActorSlot <= 1 &&
+                                   pendingTargetZone >= 0 && pendingTargetZone < Player.ZoneCount)
+                ? authPlayers[pendingAttackActorSlot].monsterZones[pendingTargetZone]
+                : null;
+            string sumLabel = sumCard != null ? $"[{sumCard.data.cardName}] (ATK {sumCard.Atk})" : "Quái thú (ATK >= 1000)";
+            promptTitleStr = $"{opp.name} vừa triệu hồi {sumLabel}!\nKÍCH HOẠT BẪY [HANG RƠI] ĐỂ PHÁ HỦY MỤC TIÊU NÀY?";
+        }
+        else if (pendingPromptType == NetPendingPromptType.RaSummonPayLP)
+        {
+            int payAmt = Mathf.Max(0, me.lifePoints - 100);
+            promptTitleStr = $"[RỒNG CÁNH THẦN CỦA RA] Bạn có muốn trả {payAmt} LP (chỉ giữ lại 100 LP) để truyền +{payAmt} ATK / +{payAmt} DEF cho Thần Ra không?";
+        }
+        else if (pendingPromptType == NetPendingPromptType.EndPhaseDiscardHand)
+        {
+            int myCount = authHands[viewerSlot] != null ? authHands[viewerSlot].Count : 0;
+            int excess = Mathf.Max(1, myCount - BattleManager.MAX_HAND_SIZE_END_PHASE);
+            promptTitleStr = $"[END PHASE - GIỚI HẠN {BattleManager.MAX_HAND_SIZE_END_PHASE} LÁ TRÊN TAY] BẠN ĐANG CÓ {myCount} LÁ — BẮT BUỘC CHỌN BỎ {excess} LÁ XUỐNG MỘ";
+        }
+
+        int activeDecisionSlot = GetActiveDecisionSlot();
+        int currentAfkCountdown = -1;
+        if (!isMatchOver && remoteClientSceneReady && afkIdleElapsed >= BattleManager.AFK_IDLE_GRACE_SECONDS)
+        {
+            float countdownElapsed = afkIdleElapsed - BattleManager.AFK_IDLE_GRACE_SECONDS;
+            currentAfkCountdown = Mathf.CeilToInt(Mathf.Max(1f, BattleManager.AFK_COUNTDOWN_SECONDS - countdownElapsed));
         }
 
         MatchStateSnapshot snap = new MatchStateSnapshot
@@ -1547,7 +2138,9 @@ public class NetworkDuelController : MonoBehaviour
             isGameOver = isMatchOver,
             didLocalWin = (isMatchOver && viewerSlot == matchWinnerSlot),
             gameOverReason = matchOverReason,
-            isRematchReset = pendingRematchResetFlag
+            isRematchReset = pendingRematchResetFlag,
+            afkCountdownSeconds = currentAfkCountdown,
+            isAfkCountdownForMe = (activeDecisionSlot == viewerSlot)
         };
 
         foreach (var c in authHands[viewerSlot])
@@ -1598,6 +2191,46 @@ public class NetworkDuelController : MonoBehaviour
             };
         }
 
+        // Hiệu ứng hình ảnh (VFX) lật góc nhìn theo từng người chơi
+        if (currentActionAttack != null)
+        {
+            snap.vfxAttack = new NetVfxAttackDto
+            {
+                hasAttack = true,
+                attackerIsMe = (currentActionAttack.attackerSlot == viewerSlot),
+                attackerZone = currentActionAttack.attackerZone,
+                isDirectAttack = currentActionAttack.isDirectAttack,
+                targetIsMe = (currentActionAttack.targetSlot == viewerSlot),
+                targetZone = currentActionAttack.targetZone
+            };
+        }
+
+        if (currentActionDestroys.Count > 0)
+        {
+            foreach (var d in currentActionDestroys)
+            {
+                snap.vfxDestroys.Add(new NetVfxDestroyDto
+                {
+                    isMe = (d.ownerSlot == viewerSlot),
+                    zoneIndex = d.zoneIndex,
+                    isDefense = d.isDefense,
+                    cardName = d.cardName ?? ""
+                });
+            }
+        }
+
+        if (currentActionGodSummon != null)
+        {
+            snap.vfxGodSummon = new NetVfxGodSummonDto
+            {
+                hasGodSummon = true,
+                godEffectType = (int)currentActionGodSummon.godEffect,
+                isMe = (currentActionGodSummon.ownerSlot == viewerSlot),
+                zoneIndex = currentActionGodSummon.zoneIndex,
+                cardName = currentActionGodSummon.cardName ?? ""
+            };
+        }
+
         return snap;
     }
 
@@ -1633,7 +2266,8 @@ public class NetworkDuelController : MonoBehaviour
             hasAttacked = mc.hasAttacked,
             positionChanged = mc.positionChanged,
             faceUpEffectTriggered = mc.faceUpEffectTriggered,
-            isMagicalHatDecoy = maskIdentity ? false : mc.isMagicalHatDecoy
+            isMagicalHatDecoy = maskIdentity ? false : mc.isMagicalHatDecoy,
+            isSpecialSummoned = mc.isSpecialSummoned
         };
     }
 
@@ -1652,6 +2286,12 @@ public class NetworkDuelController : MonoBehaviour
     {
         if (!MatchSessionConfig.LocalIsHost || !hostMatchInitialized) return;
 
+        // Mọi thao tác game hợp lệ dẫn tới cập nhật bàn đấu đều đặt lại đồng hồ Anti-AFK
+        if (!keepExistingStatus && !isMatchOver)
+        {
+            ResetAuthoritativeAfkTimer();
+        }
+
         snapshotSeq++;
 
         if (BattleManager.Instance != null)
@@ -1662,6 +2302,11 @@ public class NetworkDuelController : MonoBehaviour
         }
 
         SendSnapshotToClient(targetClientId: null, customStatus: customStatusForSlot1, clearStatusIfEmpty: keepExistingStatus);
+
+        // Xóa sự kiện VFX sau khi đã gửi cho cả Host và Client để không phát lặp ở snapshot sau
+        currentActionAttack = null;
+        currentActionDestroys.Clear();
+        currentActionGodSummon = null;
     }
 
     private void SendStatusFeedbackToSlot(int targetSlot, string message, string sfxId = "")
@@ -1717,6 +2362,8 @@ public class NetworkDuelController : MonoBehaviour
         if (senderClientId == NetworkManager.ServerClientId) return;
 
         Debug.Log($"[NetworkDuel][Host] Client (#{senderClientId}) đã tải xong BattleScene -> Gửi Snapshot!");
+        remoteClientSceneReady = true;
+        ResetAuthoritativeAfkTimer();
         currentActionSfx.Clear();
         QueueSfx("Draw");
         SendSnapshotToClient(targetClientId: senderClientId, customStatus: null);
@@ -1798,9 +2445,18 @@ public class NetworkDuelController : MonoBehaviour
             ? dto.leaverName
             : MatchSessionConfig.GetOpponentDisplayName();
 
+        if (MatchSessionConfig.LocalIsHost && !isMatchOver)
+        {
+            isMatchOver = true;
+            matchWinnerSlot = 0;
+            matchOverReason = $"{leaver} đã thoát phòng — Bạn được xử thắng!";
+            authTurnState = BattleManager.TurnState.GameOver;
+            ClearPendingPromptState();
+        }
+
         if (BattleManager.Instance != null)
         {
-            BattleManager.Instance.NotifyOpponentLeftMatch($"{leaver} đã rời trận đấu!");
+            BattleManager.Instance.NotifyOpponentLeftMatch($"{leaver} đã thoát phòng — Bạn được xử thắng!");
         }
     }
 

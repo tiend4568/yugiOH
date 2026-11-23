@@ -19,14 +19,20 @@ public enum NetDuelActionType
 
     // Bước 6: Đấu lại (Rematch) & Rời trận
     RequestRematch = 11,
-    LeaveMatch = 12
+    LeaveMatch = 12,
+
+    // Hiệu ứng kích hoạt của quái thú trên sân (Obelisk hiến tế 2 quái / Ra trả LP)
+    ActivateMonsterFieldEffect = 13
 }
 
 public enum NetPendingPromptType
 {
     None = 0,
     FlipSelectGraveyardToDeck = 1,
-    TrapMagicalHats = 2
+    TrapMagicalHats = 2,
+    TrapHoleOnSummon = 3,
+    RaSummonPayLP = 4,
+    EndPhaseDiscardHand = 5
 }
 
 /// <summary>
@@ -42,6 +48,7 @@ public class NetMonsterSlotDto
     public int atkModifier = 0;
     public int defModifier = 0;
     public bool summonedThisTurn = false;
+    public bool isSpecialSummoned = false;
     public bool hasAttacked = false;
     public bool positionChanged = false;
     public bool faceUpEffectTriggered = false;
@@ -59,6 +66,36 @@ public class NetSpellSlotDto
 }
 
 [Serializable]
+public class NetVfxAttackDto
+{
+    public bool hasAttack = false;
+    public bool attackerIsMe = false;
+    public int attackerZone = -1;
+    public bool isDirectAttack = false;
+    public bool targetIsMe = false;
+    public int targetZone = -1;
+}
+
+[Serializable]
+public class NetVfxDestroyDto
+{
+    public bool isMe = false;
+    public int zoneIndex = -1;
+    public bool isDefense = false;
+    public string cardName = "";
+}
+
+[Serializable]
+public class NetVfxGodSummonDto
+{
+    public bool hasGodSummon = false;
+    public int godEffectType = 0; // MonsterEffectType (DivineObelisk / DivineSlifer / DivineRa)
+    public bool isMe = false;
+    public int zoneIndex = -1;
+    public string cardName = "";
+}
+
+[Serializable]
 public class MatchStateSnapshot
 {
     public int snapshotSeq = 0;
@@ -71,7 +108,7 @@ public class MatchStateSnapshot
 
     // Thông tin phía người xem (Local - Hiển thị ở nửa dưới bàn đấu)
     public string myName = "Player";
-    public int myLP = 4000;
+    public int myLP = 8000;
     public int myDeckCount = 0;
     public bool myNormalSummonUsed = false;
     public int mySwordsBlockTurns = 0;
@@ -82,7 +119,7 @@ public class MatchStateSnapshot
 
     // Thông tin phía đối thủ (Opponent - Hiển thị ở nửa trên bàn đấu, đã ẩn bài trên tay & bài úp)
     public string opponentName = "Đối thủ";
-    public int opponentLP = 4000;
+    public int opponentLP = 8000;
     public int opponentDeckCount = 0;
     public int opponentHandCount = 0;
     public bool opponentNormalSummonUsed = false;
@@ -103,6 +140,23 @@ public class MatchStateSnapshot
     public bool didLocalWin = false;
     public string gameOverReason = "";
     public bool isRematchReset = false;
+
+    // Hiệu ứng hình ảnh (VFX) đồng bộ cho đòn tấn công (Quả cầu lửa), phá hủy (Đa giác vàng) & triệu hồi 3 Thần Ai Cập
+    public NetVfxAttackDto vfxAttack = new NetVfxAttackDto();
+    public List<NetVfxDestroyDto> vfxDestroys = new List<NetVfxDestroyDto>();
+    public NetVfxGodSummonDto vfxGodSummon = new NetVfxGodSummonDto();
+
+    // Bộ đếm Anti-AFK (10s không thao tác -> đếm ngược 35s -> xử thua)
+    public int afkCountdownSeconds = -1;
+    public bool isAfkCountdownForMe = false;
+}
+
+[Serializable]
+public class NetAfkTimerDto
+{
+    public int remainingSeconds = -1;
+    public bool isForMe = false;
+    public string targetPlayerName = "";
 }
 
 [Serializable]

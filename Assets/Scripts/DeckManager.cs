@@ -543,7 +543,7 @@ public class DeckManager : MonoBehaviour
         if (previewStatsText != null)
         {
             previewStatsText.text = card.cardType == CardType.Monster
-                ? $"[{card.CardTag}] LV{card.level} | {card.atk}/{card.def}"
+                ? $"[{card.CardTag}] LV{card.level} | {card.StatDisplay}"
                 : $"[{card.CardTag}]";
         }
         if (previewDescText != null) previewDescText.text = card.description;
